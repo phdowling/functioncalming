@@ -8,7 +8,6 @@ import pytest
 from openai.types.chat import ChatCompletionMessage
 from pydantic import BaseModel, Field, field_validator
 from functioncalming.client import get_completion, get_client
-from functioncalming.utils import json_dump_messages
 from tests.conftest import MockOpenAI
 
 emoji_pattern = re.compile(
@@ -120,12 +119,12 @@ async def test_simple():
     )
     with io.StringIO() as fake_file:
         responses, new_history = await get_completion(
-            messages=messages,
+            history=messages,
             tools=[Situation, EmojiTranslation],
             temperature=0,
             retries=1,
             rewrite_log_destination=fake_file,
-            rewrite_history=False,  # this is on by default, turning it off here so you can see the different histories
+            rewrite_history_in_place=False,  # this is on by default, turning it off here so you can see the different histories
             openai_client=mock_client
         )
         file_content = fake_file.getvalue()
@@ -134,8 +133,8 @@ async def test_simple():
     assert situation in dumped
 
     print(f"Real history: {len(messages)} messages. Rewritten history: {len(new_history)} messages.")
-    original_history_str = json_dump_messages(messages)
-    new_history_str = json_dump_messages(new_history)
+    original_history_str = json.dumps(messages)
+    new_history_str = json.dumps(new_history)
     assert len(messages) != len(new_history)
     assert NO_EMOJIS_FOUND in original_history_str
     assert NO_EMOJIS_FOUND not in new_history_str

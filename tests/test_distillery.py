@@ -1,10 +1,11 @@
+import json
+
 import io
 
 import pytest
 from pydantic import BaseModel
 
 from functioncalming import distillery, get_completion
-from functioncalming.utils import json_dump_messages
 
 
 class Extraction(BaseModel):
@@ -14,6 +15,11 @@ class Extraction(BaseModel):
 original_description = "Delegated extraction pipeline"
 distil_function_rename = "register_extracted_data"
 distil_function_descript = "Callback function"
+
+
+async def unrelated_function(user_message: str) -> str:
+    """Does nothing"""
+    ...
 
 
 @distillery(function_name=distil_function_rename, function_description=distil_function_descript)
@@ -32,19 +38,19 @@ async def test_distillery_call():
     dirty_history = []
     with io.StringIO() as fake_file:
         result_objects, clean_history = await get_completion(
-            messages=dirty_history,  # usually, this is not needed - here we do this just to compare the two histories
+            history=dirty_history,  # usually, this is not needed - here we do this just to compare the two histories
             system_prompt=system_prompt,
-            user_message="Hey there",
-            rewrite_system_prompt_to=distil_prompt,
-            tools=[extraction_pipeline],
-            rewrite_history=False,
+            user_message="Please call the extraction pipeline with this text",
+            distil_system_prompt=distil_prompt,
+            tools=[extraction_pipeline, unrelated_function],
+            rewrite_history_in_place=False,
             rewrite_log_destination=fake_file
         )
         file_content = fake_file.getvalue()
     assert len(dirty_history)
     assert len(clean_history)
     assert clean_history != dirty_history
-    clean_hist_str, dirty_hist_str = json_dump_messages(clean_history), json_dump_messages(dirty_history)
+    clean_hist_str, dirty_hist_str = json.dumps(clean_history), json.dumps(dirty_history)
     # check that prompts are replaced
     assert system_prompt in dirty_hist_str
     assert distil_prompt not in dirty_hist_str
@@ -59,3 +65,5 @@ async def test_distillery_call():
     assert distil_function_descript in file_content
     assert original_description not in file_content
 
+
+# TODO test replacement of a system message that was supplied via the history param, not explicitly

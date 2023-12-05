@@ -12,7 +12,7 @@ def distillery(function_name: str | None = None, function_description: str | Non
      - The message history will be re-written such called the function generated from the return type,
         producing the actual object returned by the function call directly
 
-    For example, let's look at a refinement pipeline:
+    For example, let's look at this (overly simplified) example of a refinement pipeline:
     ```
     import datetime
     from pydantic import BaseModel

@@ -10,12 +10,11 @@ from types import MappingProxyType
 from typing import Callable, Awaitable
 
 from docstring_parser import parse, Docstring
-from openai.types.chat import ChatCompletionMessageParam, ChatCompletionMessage, \
-    ChatCompletionToolParam
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam, ChatCompletionMessage
 from openai.types.shared_params import FunctionDefinition
 from pydantic import BaseModel, RootModel, create_model, Field, ValidationError
 
-type Messages = list[ChatCompletionMessage | ChatCompletionMessageParam]
+type Messages = list[ChatCompletionMessageParam]
 
 
 def pascal_to_snake(pascal_string):
@@ -43,10 +42,11 @@ class OpenAIFunction:
     definition: FunctionDefinition
     callback: Callable[[...], Awaitable[BaseModel]]
     callback_expects_user_message: bool
+    callback_expects_args_from_model: bool
     is_distillery: bool
 
     @functools.cached_property
-    def tool_definition(self):
+    def tool_definition(self) -> ChatCompletionToolParam:
         return ChatCompletionToolParam(type="function", function=self.definition)
 
 
@@ -81,6 +81,8 @@ def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
     if expects_user_message and "user_message" in schema["required"]:
         schema["required"].remove("user_message")
 
+    expects_args_from_model = bool(schema["properties"])
+
     schema.pop("title", None)
     schema.pop("description", None)
 
@@ -93,6 +95,7 @@ def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
         ),
         callback=callback,
         callback_expects_user_message=expects_user_message,
+        callback_expects_args_from_model=expects_args_from_model,
         is_distillery=is_distillery
     )
 
@@ -140,7 +143,7 @@ def basemodel_from_function(model_or_fn, name, param_descriptions) -> type[BaseM
             name: (
                 param.annotation,
                 Field(
-                    default=... if param.default is Parameter.empty else param.default,
+                    default=(... if param.default is Parameter.empty else param.default),
                     description=param_descriptions.get(name)
                 )
             )
@@ -154,16 +157,15 @@ def basemodel_from_function(model_or_fn, name, param_descriptions) -> type[BaseM
 async def invoke_callback_function(
         openai_function: OpenAIFunction,
         kwargs: dict,
-        user_message: str | None,
+        history: Messages,
         serialize_result_for_model: bool
 ) -> tuple[BaseModel, str, str | None]:
     if openai_function.callback_expects_user_message:
-        if user_message is None:
-            # TODO: what if this is a follow-up call? Maybe we should just find the last user_message dynamically?
-            logging.warning(
-                "user_message is None but callback expects user_message - did you pass `messages` by accident?"
-            )
-        kwargs = {**kwargs, "user_message": user_message}
+        last_user_message = ([m["content"] for m in history if m["role"] == "user"] or [None])[-1]
+        if last_user_message is None:
+            raise ValueError("No user message to supply to callback function!")
+        kwargs = {**kwargs, "user_message": last_user_message}
+
     result = await openai_function.callback(**kwargs)
 
     result_for_model = "{'result': 'success'}"
@@ -185,7 +187,3 @@ class FineTuningData(BaseModel):
     # todo: update this to Tool as soon as finetuning does not require legacy format anymore
     #  https://platform.openai.com/docs/guides/fine-tuning/fine-tuning-examples
     functions: list[FunctionDefinition]
-
-
-def json_dump_messages(messages: Messages, indent: int | None = None) -> str:
-    return RootModel[Messages](messages).model_dump_json(indent=indent)
