@@ -8,7 +8,7 @@ from typing import Callable, TextIO, Awaitable, Literal
 from openai.types.chat.chat_completion_message_tool_call import Function
 from pydantic import BaseModel, ValidationError
 from openai import AsyncOpenAI
-
+from openai._types import NotGiven, NOT_GIVEN
 from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall, \
     ChatCompletionToolMessageParam, ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam, \
     ChatCompletionToolChoiceOptionParam
@@ -56,7 +56,7 @@ async def get_completion(
         rewrite_history_in_place: bool = True,
         rewrite_log_destination: str | TextIO | None = None,
         openai_client: AsyncOpenAI | None = None,
-        model: Literal["gpt-3.5-turbo", "gpt-4-1106-preview"] | str = None,
+        model_name: Literal["gpt-3.5-turbo", "gpt-4-1106-preview"] | str = None,
         **kwargs
 ) -> tuple[list[BaseModel], Messages]:
     """
@@ -75,7 +75,7 @@ async def get_completion(
     :param pass_results_to_model: If true, function results (or created models) are added to the message history
     :param rewrite_log_destination: filename or io handle to log fine-tuning data to
     :param openai_client: optional AsyncOpenAI client to use (use set_client() to set a default client)
-    :param model: Which OpenAI model to use for the completion
+    :param model_name: Which OpenAI model to use for the completion
     :param kwargs:
     :return: a tuple of (created models or function responses, rewritten message history)
     """
@@ -88,8 +88,8 @@ async def get_completion(
     rewrite_cutoff = len(history)
     openai_client = openai_client or get_client()
 
-    model = model or os.environ.get("OPENAI_MODEL")
-    if model is None:
+    model_name = model_name or os.environ.get("OPENAI_MODEL")
+    if model_name is None:
         raise ValueError("No model specified and OPENAI_MODEL is not set.")
 
     tools = tools or []
@@ -114,13 +114,13 @@ async def get_completion(
         else:
             completion: ChatCompletion = await openai_client.chat.completions.create(
                 messages=history,
-                model=model,
-                tools=[openai_functions[name].tool_definition for name in available_function_names],
-                tool_choice=current_tool_choice,
+                model=model_name,
+                tools=[openai_functions[name].tool_definition for name in available_function_names] or NOT_GIVEN,
+                tool_choice=current_tool_choice if tools else NOT_GIVEN,
                 **kwargs
             )
             last_message: ChatCompletionMessage = completion.choices[0].message
-        history.append(last_message.model_dump())  # make sure the history only has dict objects
+        history.append(last_message.model_dump(exclude_unset=True))  # make sure the history only has dict objects
 
         if not last_message.tool_calls:
             break

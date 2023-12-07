@@ -142,3 +142,20 @@ async def test_simple():
     assert "tool calls failed" in original_history_str
     assert "tool calls failed" not in new_history_str
     assert "tool calls failed" not in file_content
+
+
+@pytest.mark.asyncio
+async def test_no_function():
+    _, history = await get_completion(system_prompt=None, user_message="Hello")
+
+    async def echo(text: str):
+        """Echo"""
+        return text
+
+    # make sure message history is valid to continue using
+    (result,), history = await get_completion(
+        history=history, system_prompt=None, user_message="Call echo with 'Hello'", tools=[echo]
+    )
+    assert result == "Hello"
+    _, history = await get_completion(history=history, system_prompt=None, user_message="Hello")
+
