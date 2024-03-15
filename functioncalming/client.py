@@ -55,6 +55,7 @@ async def get_completion(
         pass_results_to_model: bool = False,
         rewrite_history_in_place: bool = True,
         rewrite_log_destination: str | TextIO | None = None,
+        rewrite_log_extra_data: dict | None = None,
         openai_client: AsyncOpenAI | None = None,
         model_name: Literal["gpt-3.5-turbo", "gpt-4-1106-preview"] | str = None,
         **kwargs
@@ -74,6 +75,7 @@ async def get_completion(
     :param rewrite_history_in_place: If true, the messages list that was passed in will be modified in-place
     :param pass_results_to_model: If true, function results (or created models) are added to the message history
     :param rewrite_log_destination: filename or io handle to log fine-tuning data to
+    :param rewrite_log_extra_data: extra data to merge into the jsonl line for this log entry
     :param openai_client: optional AsyncOpenAI client to use (use set_client() to set a default client)
     :param model_name: Which OpenAI model to use for the completion
     :param kwargs:
@@ -210,7 +212,8 @@ async def get_completion(
         log_finetuning_data(
             destination=rewrite_log_destination,
             messages=rewritten_history,
-            functions=functions_coalesced
+            functions=functions_coalesced,
+            extra_data=rewrite_log_extra_data
         )
 
     return result_instances, rewritten_history
@@ -383,9 +386,19 @@ def rewrite_history(
 def log_finetuning_data(
         destination: str | TextIO,
         messages: Messages,
-        functions: list[OpenAIFunction]
+        functions: list[OpenAIFunction],
+        extra_data: dict | None = None
 ):
-    fd = FineTuningData(messages=messages, functions=[t.definition for t in functions])
+    if extra_data is not None and "messages" in extra_data:
+        logging.warning("'messages' key is being overwritten by extra data!")
+
+    if extra_data is not None and "functions" in extra_data:
+        logging.warning("'functions' key is being overwritten by extra data!")
+
+    fd = FineTuningData(
+        **{**dict(messages=messages, functions=[t.definition for t in functions]), **(extra_data or {})}
+    )
+
     log_entry = f"{fd.model_dump_json()}\n"
     if isinstance(destination, str):
         with open(destination, "a") as outf:

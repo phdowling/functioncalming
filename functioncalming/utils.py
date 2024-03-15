@@ -182,7 +182,7 @@ async def invoke_callback_function(
     return result, result_for_model, serialized
 
 
-class FineTuningData(BaseModel):
+class FineTuningData(BaseModel, extra="allow"):
     messages: Messages
     # todo: update this to Tool as soon as finetuning does not require legacy format anymore
     #  https://platform.openai.com/docs/guides/fine-tuning/fine-tuning-examples

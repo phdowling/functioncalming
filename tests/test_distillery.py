@@ -44,7 +44,8 @@ async def test_distillery_call():
             distil_system_prompt=distil_prompt,
             tools=[extraction_pipeline, unrelated_function],
             rewrite_history_in_place=False,
-            rewrite_log_destination=fake_file
+            rewrite_log_destination=fake_file,
+            rewrite_log_extra_data={"extra": "something"}
         )
         file_content = fake_file.getvalue()
     assert len(dirty_history)
@@ -64,6 +65,7 @@ async def test_distillery_call():
     # check that function description is replaced
     assert distil_function_descript in file_content
     assert original_description not in file_content
+    assert '"extra":"something"' in file_content
 
 
 # TODO test replacement of a system message that was supplied via the history param, not explicitly
