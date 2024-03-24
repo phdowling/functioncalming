@@ -39,7 +39,7 @@ DEFAULT_BEHAVIOR = "default_behavior"
 
 
 type SimpleJsonCompatible = str | int | float | bool | None
-type JsonCompatible = dict[str, SimpleJsonCompatible | JsonCompatible] | list[SimpleJsonCompatible | JsonCompatible]
+type JsonCompatible = dict[str, JsonCompatible] | list[JsonCompatible] | SimpleJsonCompatible
 type ModelOrJsonCompatible = BaseModel | JsonCompatible
 type BaseModelFunction = Callable[..., ModelOrJsonCompatible] | Callable[..., Awaitable[ModelOrJsonCompatible]]
 
