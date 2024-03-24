@@ -38,7 +38,7 @@ def set_client(client: AsyncOpenAI):
 DEFAULT_BEHAVIOR = "default_behavior"
 
 
-type SimpleJsonCompatible = str | int | float
+type SimpleJsonCompatible = str | int | float | bool | None
 type JsonCompatible = dict[str, SimpleJsonCompatible | JsonCompatible] | list[SimpleJsonCompatible | JsonCompatible]
 type ModelOrJsonCompatible = BaseModel | JsonCompatible
 type BaseModelFunction = Callable[..., ModelOrJsonCompatible] | Callable[..., Awaitable[ModelOrJsonCompatible]]

@@ -42,7 +42,7 @@ def distillery(function_name: str | None = None, function_description: str | Non
     # non-distilled two-step pipeline
     refined_event = await get_completion(
         system_prompt="Extract the given data into an event. "
-                      "Focus only fill name and description for now, "
+                      "Focus on only filling name and description for now, "
                       "do not fill date information (the refine function will do this automatically)",
         user_message="... some unstructured event data ...",
         tools=[refine_event],
