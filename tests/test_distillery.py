@@ -35,19 +35,18 @@ async def extraction_pipeline(user_message: str) -> Extraction:
 async def test_distillery_call():
     system_prompt = "To extract data for the user, delegate the task via a call to the extraction pipeline"
     distil_prompt = "Extract the data for the user and register the result using the provided function"
-    dirty_history = []
     with io.StringIO() as fake_file:
-        result_objects, clean_history = await get_completion(
-            history=dirty_history,  # usually, this is not needed - here we do this just to compare the two histories
+        calm_response = await get_completion(
             system_prompt=system_prompt,
             user_message="Please call the extraction pipeline with this text",
             distil_system_prompt=distil_prompt,
             tools=[extraction_pipeline, unrelated_function],
-            rewrite_history_in_place=False,
             rewrite_log_destination=fake_file,
             rewrite_log_extra_data={"extra": "something"}
         )
         file_content = fake_file.getvalue()
+    dirty_history = calm_response.messages_raw
+    clean_history = calm_response.messages
     assert len(dirty_history)
     assert len(clean_history)
     assert clean_history != dirty_history

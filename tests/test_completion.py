@@ -1,6 +1,7 @@
 import json
 
 import io
+import os
 
 import re
 
@@ -117,25 +118,33 @@ async def test_simple():
             },
         ]},
     )
-    with io.StringIO() as fake_file:
-        responses, new_history = await get_completion(
-            history=messages,
+    messages_before = len(messages)
+    with (io.StringIO() as fake_file):
+        calm_response = await get_completion(
+            messages=messages,
             tools=[Situation, EmojiTranslation],
             temperature=0,
             retries=1,
             rewrite_log_destination=fake_file,
-            rewrite_history_in_place=False,  # this is on by default, turning it off here so you can see the different histories
             openai_client=mock_client
         )
         file_content = fake_file.getvalue()
-    dumped = [response.model_dump() for response in responses]
-    assert len(responses) == 2
+
+    # check history is unaltered
+    messages_after = len(messages)
+    assert messages_before == messages_after
+
+    dumped = [response.model_dump() for response in calm_response.tool_call_results]
+    assert len(calm_response.tool_call_results) == 2
     assert situation in dumped
 
-    print(f"Real history: {len(messages)} messages. Rewritten history: {len(new_history)} messages.")
-    original_history_str = json.dumps(messages)
-    new_history_str = json.dumps(new_history)
-    assert len(messages) != len(new_history)
+    print(
+        f"Real history: {len(calm_response.messages_raw)} messages. "
+        f"Rewritten history: {len(calm_response.messages)} messages."
+    )
+    original_history_str = json.dumps(calm_response.messages_raw)
+    new_history_str = json.dumps(calm_response.messages)
+    assert len(calm_response.messages_raw) != len(calm_response.messages)
     assert NO_EMOJIS_FOUND in original_history_str
     assert NO_EMOJIS_FOUND not in new_history_str
 
@@ -146,16 +155,33 @@ async def test_simple():
 
 @pytest.mark.asyncio
 async def test_no_function():
-    _, history = await get_completion(system_prompt=None, user_message="Hello")
+    calm_response = await get_completion(system_prompt=None, user_message="Hello")
+    assert calm_response.messages[0]['content'] == "Hello"
+    assert calm_response.messages[1]['role'] == 'assistant'
+    assert calm_response.messages[1] == calm_response.last_message
 
     async def echo(text: str):
         """Echo"""
         return text
 
     # make sure message history is valid to continue using
-    (result,), history = await get_completion(
-        history=history, system_prompt=None, user_message="Call echo with 'Hello'", tools=[echo]
+    calm_response = await get_completion(
+        messages=calm_response.messages,
+        system_prompt=None,
+        user_message="Call `echo` with the argument 'Hello'", tools=[echo]
     )
-    assert result == "Hello"
-    _, history = await get_completion(history=history, system_prompt=None, user_message="Hello")
+    assert calm_response.tool_call_results[0] == "Hello"
+    assert calm_response.last_message['content'] == '"Hello"'
+    assert calm_response.last_message['role'] == 'tool'
+
+@pytest.mark.asyncio
+async def test_cost_tracking():
+    calm_response = await get_completion(
+        system_prompt=None, user_message="Hello", model="gpt-3.5-turbo"
+    )
+
+    assert calm_response.cost > 0
+    assert calm_response.usage.total_tokens > 5
+    assert calm_response.model.startswith("gpt-3.5-turbo")
+
 

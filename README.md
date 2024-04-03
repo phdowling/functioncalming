@@ -10,7 +10,8 @@ functioncalming comes with support for:
 - Automatically passing function/tool results back to the model
 - Automatic message history re-writing to hide failed function calls that were re-tried
 - Create fine-tuning data to make model better at calling your functions/models with near zero config
-- Create fine-tuning data for distilling a complex pipeline to a simple model via a simple decorator (`@distillery`) 
+- Create fine-tuning data for distilling a complex pipeline to a simple model via a simple decorator (`@distillery`)
+- Reporting the cost of your API requests (using OpenAI pricing as of April 2024)
 
 ## Who is this for?
 Basically, functioncalming provides useful utilities for any case where you find yourself using function calling in OpenAI. 
@@ -29,23 +30,23 @@ from functioncalming.client import get_completion
 
 
 class Actor(BaseModel):
-  """
-  A person or non-human actor involved in a situation
-  """
-  name: str
-  adjectives: list[str]
+    """
+    A person or non-human actor involved in a situation
+    """
+    name: str
+    adjectives: list[str]
 
 
 class Situation(BaseModel):
-  """
-  A situation or event involving a number of actors
-  """
-  actors: list[Actor]
-  action: str
+    """
+    A situation or event involving a number of actors
+    """
+    actors: list[Actor]
+    action: str
 
 
 class EmojiTranslation(BaseModel):
-  translation: str
+    translation: str
 
 
 PROMPT = """You help extract cleaned data from unstructured input text 
@@ -54,24 +55,27 @@ You also have a tendency to always make a mistake the first time you call a func
 """
 
 history = [
-  {'role': 'system', 'content': PROMPT},
-  {'role': 'user', 'content': "The quick brown fox jumps over the lazy dog"}
+    {'role': 'system', 'content': PROMPT},
+    {'role': 'user', 'content': "The quick brown fox jumps over the lazy dog"}
 ]
 
 
 async def main():
-  responses, cleaned_history = await get_completion(
-    history=history,
-    tools=[Situation, EmojiTranslation],
-    temperature=0,
-    retries=1,
-    rewrite_log_destination='finetune.jsonl',
-    rewrite_history_in_place=False  # this is on by default, turning it off here so you can see the different histories 
-  )
-  print(responses[0].model_dump_json(
-    indent=4))  # {"actors": [{"name": "fox", "adjectives": ["quick", "brown"]}, {"name": "dog", "adjectives": ["lazy"]}], "action": "jumping over"}
-  print(responses[1].model_dump_json(indent=4))  # {"translation": "🦊↗️🐶"}
-  print(f"Real history: {len(history)} messages. Rewritten history: {len(cleaned_history)} messages.")
+    calm_response = await get_completion(
+        messages=history,
+        tools=[Situation, EmojiTranslation],
+        temperature=0,
+        retries=1,
+        rewrite_log_destination='finetune.jsonl', 
+    )
+    print(calm_response.success)
+    print(calm_response.retries_done)
+    print(calm_response.usage)  # total tokens used 
+    print(calm_response.cost)  # estimated dollar cost of all requests that were done
+    print(calm_response.tool_call_results[0].model_dump_json(
+        indent=4))  # {"actors": [{"name": "fox", "adjectives": ["quick", "brown"]}, {"name": "dog", "adjectives": ["lazy"]}], "action": "jumping over"}
+    print(calm_response.tool_call_results[1].model_dump_json(indent=4))  # {"translation": "🦊↗️🐶"}
+    print(f"Clean, rewritten history: {len(calm_response.messages)} messages. Real history: {len(calm_response.messages_raw)} messages.")
 ```
 ## Generating fine-tuning data for distillation
 functioncalming tries to make it easy to generate data for function distillation - i.e. fine-tuning a cheaper, faster "student" pipeline

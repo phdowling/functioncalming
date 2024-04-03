@@ -6,6 +6,7 @@ import pytest
 from openai.types.chat import ChatCompletionMessage
 
 from functioncalming import get_completion, get_client
+from functioncalming.utils import ToolCallError
 from tests.conftest import MockOpenAI
 
 
@@ -25,13 +26,12 @@ def get_time(city: str, zip_code: str | None = None) -> str:
 
 @pytest.mark.asyncio
 async def test_simple_function_call():
-    (weather_results, *_), message_history = await get_completion(
+    calm_response = await get_completion(
         user_message="What's the weather like in Berlin?",
         tools=[get_weather, get_time],
-        pass_results_to_model=True
     )
-    assert "snow" in json.dumps(message_history)
-    assert weather_results == "lots of snow"
+    assert "snow" in json.dumps(calm_response.messages)
+    assert calm_response.tool_call_results[0] == "lots of snow"
 
 
 @pytest.mark.asyncio
@@ -70,21 +70,50 @@ async def test_wrong_function_name():
     )
     with io.StringIO() as fake_file:
         history = []
-        (weather_results, *_), message_history = await get_completion(
-            history=history,
+        calm_response = await get_completion(
+            messages=history,
             user_message="What's the weather like in Berlin?",
             tools=[get_weather, get_time],
-            pass_results_to_model=True,
-            rewrite_history_in_place=False,
             rewrite_log_destination=fake_file,
             retries=2,
             openai_client=mock_client
         )
         file_content = fake_file.getvalue()
-    assert "does not exist" in str(history)
-    assert "snow" in weather_results
+    assert "does not exist" in str(calm_response.messages_raw)
+    assert "lots of snow" in calm_response.tool_call_results
 
 # TODO simulate the model calling a function incorrectly and make sure a retry is done
+@pytest.mark.asyncio
+async def test_retry_happens():
+    raised = False
+
+    def weird_function(text: str = "hello") -> str:
+        nonlocal raised
+        if not raised:
+            raised = True
+            raise ToolCallError("Try again!")
+        return "success"
+
+    calm_response = await get_completion(
+        user_message="Hi there",
+        tools=[weird_function],
+        retries=1
+    )
+    assert calm_response.success
+    assert calm_response.retries_done == 1
+    assert calm_response.tool_call_results[0] == "success"
+
+    raised = False
+    calm_response = await get_completion(
+        user_message="Hi there",
+        tools=[weird_function],
+        retries=0
+    )
+    assert not calm_response.success
+    assert calm_response.retries_done == 0
+    assert not calm_response.tool_call_results
+
+
 
 # TODO make sure that retry information is hidden in the clean message history
 

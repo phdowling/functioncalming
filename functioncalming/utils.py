@@ -36,6 +36,9 @@ class InnerValidationError(Exception):
         self.original_error = original_error
 
 
+class ToolCallError(ValueError):
+    pass
+
 @dataclasses.dataclass
 class OpenAIFunction:
     name: str
