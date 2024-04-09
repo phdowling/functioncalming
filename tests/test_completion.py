@@ -174,6 +174,7 @@ async def test_no_function():
     assert calm_response.last_message['content'] == '"Hello"'
     assert calm_response.last_message['role'] == 'tool'
 
+
 @pytest.mark.asyncio
 async def test_cost_tracking():
     calm_response = await get_completion(

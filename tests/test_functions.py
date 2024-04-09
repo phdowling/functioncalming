@@ -4,6 +4,7 @@ import json
 
 import pytest
 from openai.types.chat import ChatCompletionMessage
+from pydantic import BaseModel, Field
 
 from functioncalming import get_completion, get_client
 from functioncalming.utils import ToolCallError
@@ -32,6 +33,19 @@ async def test_simple_function_call():
     )
     assert "snow" in json.dumps(calm_response.messages)
     assert calm_response.tool_call_results[0] == "lots of snow"
+
+
+@pytest.mark.asyncio
+async def test_shortcut():
+    def noop():
+        return "works"
+    calm_response = await get_completion(
+        user_message="Does not matter what I type here",
+        tools=[noop],
+    )
+    assert calm_response.tool_call_results[0] == "works"
+    assert calm_response.cost == 0
+    assert calm_response.usage.total_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -82,7 +96,7 @@ async def test_wrong_function_name():
     assert "does not exist" in str(calm_response.messages_raw)
     assert "lots of snow" in calm_response.tool_call_results
 
-# TODO simulate the model calling a function incorrectly and make sure a retry is done
+
 @pytest.mark.asyncio
 async def test_retry_happens():
     raised = False
@@ -112,6 +126,81 @@ async def test_retry_happens():
     assert not calm_response.success
     assert calm_response.retries_done == 0
     assert not calm_response.tool_call_results
+
+
+@pytest.mark.asyncio
+async def test_abbreviate():
+
+    class GoodParam(BaseModel):
+        """
+        Main parameter model.
+        """
+
+        number: int = Field(
+            ..., description="This is the main input parameter, please make sure to always pass it"
+        )
+
+    class BadParam(GoodParam):
+        """
+        This is the main param of the other function.
+        If we add many tokens here, the request becomes more expensive. For that reason, it's advisable to either keep
+        descriptions short, or to use abbreviated tool calling!
+        This happens to have a pretty long description, most of it is irrelevant but it sure does add to the total
+        token count!
+        """
+        another_param: dict = Field(..., description="Especially if there are more parameters!")
+
+    def good_function(param: GoodParam) -> str:
+        """
+        This is the function you need to call
+        :param text: A text param
+        :return:
+        """
+        return str(param.number)
+
+    bad_tools = []
+    for i in range(10):
+        def bad_function(param: BadParam) -> str:
+            """
+            This is a function you will not call.
+            :param text: A text param
+            :return:
+            """
+            return "bad"
+        bad_function.__name__ = f"bad_function_{i}"
+        bad_tools.append(bad_function)
+
+    unabbreviated_calm_response = await get_completion(
+        user_message="Call the good function please, use 123 as the input number",
+        tools=[good_function, *bad_tools],
+        abbreviate_tools=False,
+        retries=0,
+        _track_raw_request_summaries=True,
+    )
+    assert unabbreviated_calm_response.success
+    assert unabbreviated_calm_response.retries_done == 0
+    assert len(unabbreviated_calm_response.raw_completions) == 1
+    assert unabbreviated_calm_response.tool_call_results[0] == "123"
+    unabbreviated_prompt_len = unabbreviated_calm_response.usage.prompt_tokens
+    unabbreviated_cost = unabbreviated_calm_response.cost
+
+    abbreviated_calm_response = await get_completion(
+        user_message="Call the good function please, use 123 as the input number",
+        tools=[good_function, *bad_tools],
+        abbreviate_tools=True,
+        retries=0,
+        _track_raw_request_summaries=True,
+    )
+    abbreviated_prompt_len = abbreviated_calm_response.usage.prompt_tokens
+    abbreviated_cost = abbreviated_calm_response.cost
+    assert abbreviated_calm_response.success
+    assert abbreviated_calm_response.retries_done == 0
+    assert len(abbreviated_calm_response.raw_completions) == 2
+    assert abbreviated_calm_response.tool_call_results[0] == "123"
+
+    assert abbreviated_prompt_len < unabbreviated_prompt_len
+    assert abbreviated_cost < unabbreviated_cost
+
 
 
 
