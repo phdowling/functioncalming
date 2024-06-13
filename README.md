@@ -1,4 +1,8 @@
 # functioncalming
+## Installation
+`pip install functioncalming`
+
+## Overview
 Get (near-)guaranteed structured responses from OpenAI using pydantic and function calling (and, if you like, fine-tuning).
 
 functioncalming uses OpenAI's function calling in combination with pydantic model validation to hide away the messy details of getting structured responses from an LLM.
