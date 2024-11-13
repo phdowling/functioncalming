@@ -1,3 +1,5 @@
+import types
+
 import dataclasses
 
 import logging
@@ -6,8 +8,9 @@ import functools
 import inspect
 import json
 from inspect import Parameter
+from pydantic_core import PydanticUndefined
 from types import MappingProxyType
-from typing import Callable, Awaitable, TextIO
+from typing import Callable, Awaitable, TextIO, Literal, get_origin, get_args, ForwardRef, Union
 
 from docstring_parser import parse, Docstring
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam, ChatCompletionMessage
@@ -44,25 +47,140 @@ class ToolCallError(ValueError):
 @dataclasses.dataclass
 class OpenAIFunction:
     name: str
-    definition: FunctionDefinition
+    description: str
+
     callback: Callable[[...], Awaitable[BaseModel]]
-    unvalidated_model: type[BaseModel]
+    non_validating_model: type[BaseModel]
     model: type[BaseModel]
-    callback_expects_args_from_model: bool
     was_defined_as_basemodel: bool
+
+    @functools.cached_property
+    def schema(self):
+        # TODO use non-validating model for functions? Do the same best practices apply?
+        schema = self.non_validating_model.model_json_schema()
+        schema["strict"] = True  # turns on structured outputs
+        schema.pop("title", None)
+        schema.pop("description", None)
+        return schema
+
+    @property
+    def definition(self) -> FunctionDefinition:
+        return FunctionDefinition(
+            name=self.name,
+            description=self.description,
+            parameters=self.schema
+        )
+
+    @property
+    def callback_expects_args_from_model(self) -> bool:
+        return bool(self.schema["properties"])
 
     @functools.cached_property
     def tool_definition(self) -> ChatCompletionToolParam:
         return ChatCompletionToolParam(type="function", function=self.definition)
 
 
-@functools.lru_cache()
-def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
-    # double check: do we need to iterate through the whole schema to find references to plain name and replace them?
-    # could see this being the case for recursive models
+UNSET_PLACEHOLDER = "__UNSET"
+_model_cache: dict[str, type[BaseModel]] = {}
 
-    # todo is there any benefit to function-style naming?
-    # name = pascal_to_snake(model_or_fn.__name__)
+
+def adjust_annotation_model_references(
+        annotation,
+        _forward_declarations: set[type[BaseModel]],
+):
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is not None and origin is not Literal:
+        adjusted_args = []
+        for arg in args:
+            adjusted_args.append(
+                adjust_annotation_model_references(arg, _forward_declarations)
+            )
+        if origin is types.UnionType:
+            annotation = Union[*adjusted_args]
+        else:
+            annotation = origin[*adjusted_args]
+    else:
+        if isinstance(annotation, str):
+            annotation = ForwardRef(annotation)
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            if annotation in _forward_declarations:
+                annotation = ForwardRef(annotation.__name__)
+            else:
+                annotation = get_or_make_adjusted_model_for_openai(
+                    annotation, _forward_declarations=_forward_declarations
+                )
+    return annotation
+
+
+def adjust_field_info_for_openai(
+        field_info: FieldInfo,
+        _forward_declarations: set[type[BaseModel]],
+):
+    field_info = FieldInfo.merge_field_infos(field_info)  # makes a copy
+
+    # make sure all references to BaseModels are the OpenAI-adjusted variant
+    annotation = adjust_annotation_model_references(field_info.annotation, _forward_declarations)
+
+    # get rid of any actual default value, but allow model to place a default placeholder token
+    if field_info.default is not PydanticUndefined:
+        field_info.default = PydanticUndefined
+        annotation = annotation | Literal[UNSET_PLACEHOLDER]
+        field_info.description = "\n".join(
+            [
+                field_info.description or '',
+                f'This field has a default value, to use it, set the field to "{UNSET_PLACEHOLDER}".'
+            ]
+        ).strip()
+
+    # subsume examples
+    if field_info.examples:
+        field_info.description = "\n".join(
+            [
+                field_info.description or '',
+                f"Examples:\n{"\n".join(ex for ex in field_info.examples)}"
+            ]
+        ).strip()
+        field_info.examples = None
+    return annotation, field_info
+
+
+def get_or_make_adjusted_model_for_openai(
+        model: type[BaseModel],
+        keep_in_model_cache: bool = True,
+        _forward_declarations: set[type[BaseModel]] | None = None,
+):
+    _forward_declarations = set() if _forward_declarations is None else _forward_declarations
+    _forward_declarations.add(model)
+    if model in _model_cache:
+        return _model_cache[model]
+
+    # make a clone with no custom validators so OpenAI has a better shot of instantiating the model
+    non_validating_model: type[BaseModel] = create_model(
+        model.__name__,
+        **{
+            field_name: adjust_field_info_for_openai(
+                field_info=field_info,
+                _forward_declarations=_forward_declarations
+            )
+            for field_name, field_info
+            in model.__fields__.items()
+        }
+    )  # clone, so we don't alter the original
+    non_validating_model.model_config["extra"] = "forbid"
+    if keep_in_model_cache:
+        _model_cache[model] = non_validating_model
+    return non_validating_model
+
+
+def rebuild_cached_models():
+    namespace = {model.__name__: model for model in _model_cache.values()}
+    for model in _model_cache.values():
+        model.model_rebuild(_types_namespace=namespace)
+
+
+@functools.lru_cache()
+def create_openai_function(model_or_fn: BaseModel | Callable, keep_in_model_cache: bool = True) -> OpenAIFunction:
     was_defined_as_basemodel = False
     name = model_or_fn.__name__
     description = model_or_fn.__doc__
@@ -74,20 +192,10 @@ def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
     if isinstance(model_or_fn, type) and issubclass(model_or_fn, BaseModel):
         was_defined_as_basemodel = True
         as_model = model_or_fn
-        annotations = model_or_fn.__annotations__
-        # make a clone with no custom validators so OpenAI has a better shot of instantiating the model
-        as_unvalidated_model = create_model(
-            name,
-            **{
-                field_name: (annotations[field_name], field_info)
-                for field_name, field_info
-                in as_model.__fields__.items()
-            }
-        )  # clone, so we don't alter the original
-        as_unvalidated_model.model_config["extra"] = "forbid"
 
         async def callback(*args, **kwargs):  # this is just to always make the callback awaitable
-            return model_or_fn(*args, **kwargs)
+            serialized = remove_unsets(kwargs)
+            return model_or_fn(**serialized)
 
     elif inspect.isfunction(model_or_fn):
         description, param_descriptions_from_docstring = description_and_param_docs_from_docstring(description)
@@ -96,30 +204,18 @@ def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
             name,
             param_descriptions_from_docstring
         )
-        as_unvalidated_model = as_model
+
         callback = create_callback_function_for_tool_use(model_or_fn, as_model)
     else:
         raise ValueError(f"Don't know how to turn {model_or_fn} into an OpenAI function")
 
-
-    schema = as_model.model_json_schema()
-    schema["strict"] = True  # turns on structured outputs
-
-    expects_args_from_model = bool(schema["properties"])
-
-    schema.pop("title", None)
-    schema.pop("description", None)
+    non_validating_model = get_or_make_adjusted_model_for_openai(as_model, keep_in_model_cache=keep_in_model_cache)
 
     return OpenAIFunction(
         name=name,
-        definition=FunctionDefinition(
-            name=name,
-            description=description.strip(),
-            parameters=schema
-        ),
+        description=description,
         callback=callback,
-        callback_expects_args_from_model=expects_args_from_model,
-        unvalidated_model=as_unvalidated_model,
+        non_validating_model=non_validating_model,
         model=as_model,
         was_defined_as_basemodel=was_defined_as_basemodel
     )
@@ -130,7 +226,7 @@ def create_abbreviated_openai_function(model_or_fn: Callable | BaseModel) -> Ope
         pass
     stub.__name__ = model_or_fn.__name__
     stub.__doc__ = model_or_fn.__doc__
-    return create_openai_function(stub)
+    return create_openai_function(stub, keep_in_model_cache=False)
 
 
 def description_and_param_docs_from_docstring(function_docstring):
@@ -143,13 +239,24 @@ def description_and_param_docs_from_docstring(function_docstring):
     return description, param_descriptions
 
 
+def remove_unsets(result: dict):
+    for field_name, field_value in list(result.items()):
+        if field_value == UNSET_PLACEHOLDER:
+            del result[field_name]
+        if isinstance(field_value, dict):
+            result[field_name] = remove_unsets(field_value)
+        if isinstance(field_value, list):
+            result[field_name] = [remove_unsets(item) if isinstance(item, dict) else item for item in field_value]
+    return result
+
+
 def create_callback_function_for_tool_use(
         fn: Callable[[...], BaseModel] | Callable[[...], Awaitable[BaseModel]],
         validator: type[BaseModel]
 ):
     @functools.wraps(fn)
     async def callback(**kwargs):
-        parsed = validator(**kwargs)  # validation errors from here get raised as-is
+        parsed = validator(**remove_unsets(kwargs))  # validation errors from here get raised as-is
         try:
             res = fn(**dict(parsed))
             if inspect.isawaitable(res):

@@ -21,7 +21,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatComplet
 from openai.types.completion_usage import CompletionUsage
 from functioncalming.utils import invoke_callback_function, FineTuningData, InnerValidationError, \
     create_openai_function, OpenAIFunction, ToolCallError, create_abbreviated_openai_function, \
-    serialize_openai_function_result, log_finetuning_data
+    serialize_openai_function_result, log_finetuning_data, UNSET_PLACEHOLDER, rebuild_cached_models
 from functioncalming.types import BaseModelOrJsonCompatible, Messages, BaseModelFunction
 
 _client = None
@@ -339,7 +339,7 @@ async def get_completion(
             assert len(available_function_names) == 1
             oai_fun_name, = available_function_names
             oai_fun = openai_functions[oai_fun_name]
-            outcome = validate_structured_output(last_message, openai_function=oai_fun)
+            outcome = await validate_structured_output(last_message, openai_function=oai_fun)
             had_successful_structured_output = outcome.success
             outcomes = [outcome]
             # a structured response is actually not a tool call
@@ -427,6 +427,16 @@ class RawRequestSummary:
     tool_choice: ChatCompletionToolChoiceOptionParam | dict | NotGiven
 
 
+def _maybe_resolve_single_tool_choice(tool_choice_for_api_call, available_function_names):
+    name_of_only_tool = None
+    if tool_choice_for_api_call == "required" and len(available_function_names) == 1:
+        name_of_only_tool, = available_function_names
+    if tool_choice_for_api_call is not NOT_GIVEN and isinstance(tool_choice_for_api_call, dict):
+        tool_choice_for_api_call: ChatCompletionNamedToolChoiceParam
+        name_of_only_tool = tool_choice_for_api_call["function"]["name"]
+    return name_of_only_tool
+
+
 async def _call_openai_with_structured_outputs_if_possible(
         messages: Messages,
         model: str,
@@ -437,20 +447,16 @@ async def _call_openai_with_structured_outputs_if_possible(
         _track_raw_request_summaries: bool,
         **kwargs
 ) -> ChatCompletion | ParsedChatCompletion:
-    current_tools_by_name = {name: openai_functions[name].tool_definition for name in available_function_names}
 
     response_format: type[BaseModel] | None = None
-    if tool_choice_for_api_call == "required" and len(current_tools_by_name) == 1:
-        response_format, = current_tools_by_name.values()  # take first and only tool
-    if tool_choice_for_api_call is not NOT_GIVEN and isinstance(tool_choice_for_api_call, dict):
-        tool_choice_for_api_call: ChatCompletionNamedToolChoiceParam
-        name_of_tool = tool_choice_for_api_call["function"]["name"]
+    name_of_only_tool = _maybe_resolve_single_tool_choice(
+        tool_choice_for_api_call,
+        available_function_names
+    )
+    if name_of_only_tool is not None and openai_functions[name_of_only_tool].was_defined_as_basemodel:
+        # if the tool was a function, we supply it via tools instead - OpenAI docs say that is best practice
+        response_format = openai_functions[name_of_only_tool].non_validating_model
 
-        if openai_functions[name_of_tool].was_defined_as_basemodel:
-            # if the tool was a function, we supply it via tools instead - OpenAI docs say that is best practice
-            response_format = openai_functions[name_of_tool].unvalidated_model
-
-    tools_for_api_call = list(current_tools_by_name.values()) or NOT_GIVEN
     if response_format and structured_outputs_available(model_name=model):
         # here we know that we definitely want the output to match one specific JSONSchema spec,
         # so we can use structured outputs.
@@ -460,7 +466,14 @@ async def _call_openai_with_structured_outputs_if_possible(
             model=model,
             response_format=response_format
         )
+        tools_for_api_call = [openai_functions[name_of_only_tool].tool_definition] or NOT_GIVEN
     else:
+        tools_for_api_call = [
+            openai_functions[name].tool_definition
+            for name
+            in available_function_names
+        ] or NOT_GIVEN
+
         generated_completion: ChatCompletion = await openai_client.chat.completions.create(
             messages=messages,
             model=model,
@@ -544,17 +557,20 @@ class ToolCallOutcome:
         )
 
 
-def validate_structured_output(
+async def validate_structured_output(
         message: ParsedChatCompletionMessage, openai_function: OpenAIFunction
 ) -> StructuredOutputOutcome:
     success = True
     try:
-        result = openai_function.model(**message.parsed.model_dump())
+        result = await openai_function.callback(**message.parsed.model_dump())
     except Exception as e:
         result = e
         success = False
     return StructuredOutputOutcome(
-        success=success, raw_content=message.content, result=result, tool_name=openai_function.name
+        success=success,
+        raw_content=message.content,
+        result=result,
+        tool_name=openai_function.name
     )
 
 
@@ -693,11 +709,13 @@ def process_tool_definitions(tools_raw) -> ProcessedFunctions:
     # Note: these are indexed by their original name
     abbreviated_functions: dict[str, OpenAIFunction] = {}
     for model_or_fn in tools_raw:
-        openai_function = create_openai_function(model_or_fn)
+        openai_function = create_openai_function(model_or_fn, keep_in_model_cache=True)
         openai_functions[openai_function.name] = openai_function
 
         abbreviated_function = create_abbreviated_openai_function(model_or_fn=model_or_fn)
         abbreviated_functions[abbreviated_function.name] = abbreviated_function
+
+    rebuild_cached_models()
 
     return ProcessedFunctions(
         openai_functions=openai_functions, abbreviated_openai_functions=abbreviated_functions
