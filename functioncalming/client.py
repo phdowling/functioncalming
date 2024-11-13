@@ -5,7 +5,7 @@ import uuid
 import json
 import logging
 import os
-from typing import TextIO, Literal, Dict
+from typing import TextIO, Literal, Dict, Any
 from functools import cached_property
 
 from openai._types import NOT_GIVEN, NotGiven
@@ -17,7 +17,7 @@ from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall, \
     ChatCompletionToolMessageParam, ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam, \
     ChatCompletionToolChoiceOptionParam, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, \
-    ChatCompletionToolParam
+    ChatCompletionToolParam, ChatCompletionNamedToolChoiceParam, ParsedChatCompletion, ParsedChatCompletionMessage
 from openai.types.completion_usage import CompletionUsage
 from functioncalming.utils import invoke_callback_function, FineTuningData, InnerValidationError, \
     create_openai_function, OpenAIFunction, ToolCallError, create_abbreviated_openai_function, \
@@ -46,28 +46,46 @@ def set_client(client: AsyncOpenAI):
 DEFAULT_BEHAVIOR = "default_behavior"
 
 
+def structured_outputs_available(model_name: str):
+    if model_name == "gpt-4o-2024-05-13":
+        return False
+    return model_name.startswith('o1') or model_name.startswith('gpt-4o')
+
+
+# cost per 1MM token
 COSTS_BY_MODEL = {
+    # o1 and 01-mini
+    "o1-preview": (15.0, 60.0),
+    "o1-preview-2024-09-12": (15.0, 60.0),
+    "o1-mini": (3.0, 12.0),
+    "o1-mini-2024-09-12": (3.0, 12.0),
+    # 4o and 4o-mini
+    "gpt-4o-2024-05-13": (5.0, 15.0),  # no structured outputs yet!
+    "gpt-4o-2024-08-06": (2.5, 10.0),
+    "gpt-4o": (2.5, 10.0),
+    "gpt-4o-mini": (0.15, 0.6),
+    "gpt-4o-mini-2024-07-18": (0.15, 0.6),
     # GPT-4 Turbo
-    "gpt-4-turbo": (0.01, 0.03),
-    "gpt-4-0125-preview": (0.01, 0.03),  # actually a Turbo model
-    "gpt-4-1106-preview": (0.01, 0.03),  # actually a Turbo model
-    "gpt-4-vision-preview": (0.01, 0.03),
-    "gpt-4-1106-vision-preview": (0.01, 0.03),
+    "gpt-4-turbo": (10., 30.),
+    "gpt-4-0125-preview": (10., 30.),  # actually a Turbo model
+    "gpt-4-1106-preview": (10., 30.),  # actually a Turbo model
+    "gpt-4-vision-preview": (10., 30.),
+    "gpt-4-1106-vision-preview": (10., 30.),
+    "gpt-4-turbo-2024-04-09": (10., 30.),
     # GPT-4
-    "gpt-4": (0.03, 0.06),
-    "gpt-4-0613": (0.03, 0.06),
-    "gpt-4-32k": (0.06, 0.12),
+    "gpt-4": (30., 60.),
+    "gpt-4-0613": (30., 60.),
+    "gpt-4-32k": (60., 120.),
     "gpt-4-32k-0613": (0.06, 0.12),
     # GPT 3.5
-    "gpt-3.5-turbo": (0.0005, 0.0015),
-    "gpt-3.5-turbo-0125": (0.0005, 0.0015),
-    "gpt-3.5-turbo-1106": (0.0005, 0.0015),
-    "gpt-3.5-turbo-0301": (0.0005, 0.0015),  # available in playground but not in docs?
-    "gpt-3.5-turbo-instruct": (0.0015, 0.0020),  # not actually a chat model
-    # deprecated 3.5
-    "gpt-3.5-turbo-0613": (0.0005, 0.0015),
-    "gpt-3.5-turbo-16k-0613": (0.0005, 0.0015),
-    "gpt-3.5-turbo-16k": (0.0005, 0.0015),
+    "gpt-3.5-turbo": (0.5, 1.5),  # not sure actually
+    "gpt-3.5-turbo-0125": (0.5, 1.5),
+    "gpt-3.5-turbo-1106": (1., 2.),
+    "gpt-3.5-turbo-instruct": (1.5, 2.0),  # not actually a chat model
+    "gpt-3.5-turbo-16k-0613": (3., 4.),
+    "gpt-3.5-turbo-0613": (1.5, 2.),
+    "gpt-3.5-turbo-0301": (1.5, 2.),
+    "gpt-3.5-turbo-16k": (3., 4.),
 }
 
 
@@ -120,10 +138,19 @@ class CalmResponse:
     def usage(self) -> CompletionUsage:
         return self._cost_model_usage[2]
 
+    @property
+    def unknown_costs(self) -> bool:
+        """
+        If the model used is not in the cost lookup table, no cost can be determined and this field is True.
+        This can happen with newly released models.
+        """
+        return self._cost_model_usage[3]
+
     @cached_property
-    def _cost_model_usage(self) -> tuple[str | None, float, CompletionUsage]:
+    def _cost_model_usage(self) -> tuple[str | None, float, CompletionUsage, bool]:
         total_cost = 0.
         model = None
+        some_cost_unknown = False
         usage = CompletionUsage(
             completion_tokens=0, prompt_tokens=0, total_tokens=0
         )
@@ -134,15 +161,19 @@ class CalmResponse:
             model = completion.model
             prompt_tokens = completion.usage.prompt_tokens
             completion_tokens = completion.usage.completion_tokens
-            prompt_costs_per_1k, completion_costs_per_1k = COSTS_BY_MODEL[model]
             usage.completion_tokens += completion_tokens
             usage.prompt_tokens += prompt_tokens
-            total_cost += (
-                    prompt_costs_per_1k * prompt_tokens / 1000.
-                    + completion_costs_per_1k * completion_tokens / 1000.
+            prompt_costs_per_1mm, completion_costs_per_1mm = COSTS_BY_MODEL.get(model, (0., 0.))
+            additional_cost = (
+                    prompt_costs_per_1mm * prompt_tokens / 1_000_000.
+                    + completion_costs_per_1mm * completion_tokens / 1_000_000.
             )
+
+            total_cost += additional_cost
+            if additional_cost == 0:
+                some_cost_unknown = True
         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
-        return model, total_cost, usage
+        return model, total_cost, usage, some_cost_unknown
 
 
 async def get_completion(
@@ -206,6 +237,10 @@ async def get_completion(
     tools = tools or []
     calm_functions = process_tool_definitions(tools)
 
+    if abbreviate_tools and len(tools) < 2:
+        logging.warning("Abbreviation mode deactivated since there are not multiple tools.")
+        abbreviate_tools = False
+
     abbreviation_mode = abbreviate_tools
     abbreviation_mode_attempted_calls: set[str] = set()
 
@@ -228,6 +263,7 @@ async def get_completion(
         # this will be cut off once abbreviation mode is no longer active
         internal_messages.append({"role": 'system', 'content': abbreviation_system_prompt})
 
+    had_successful_structured_output = False
     errors: list[Exception] | None = []
     while total_completions_generated < total_generations_allowed:
         openai_functions: dict[str, OpenAIFunction] = calm_functions.openai_functions
@@ -240,7 +276,7 @@ async def get_completion(
                 ) from ExceptionGroup("Tool calling validation errors", errors)
             openai_functions = calm_functions.abbreviated_openai_functions
 
-        generated_completion = await _generate_one_completion(
+        generated_completion: ChatCompletion | ParsedChatCompletion = await _generate_one_completion(
             messages=internal_messages,
             openai_functions=openai_functions,
             available_function_names=available_function_names,
@@ -253,52 +289,73 @@ async def get_completion(
         total_completions_generated += 1
         raw_completions.append(generated_completion)
 
-        last_message: ChatCompletionMessage = generated_completion.choices[0].message
+        last_message: ChatCompletionMessage | ParsedChatCompletionMessage = generated_completion.choices[0].message
+
+        exclusions = set()
+        if not last_message.tool_calls:
+            exclusions.add("tool_calls")  # emtpy list causes a validation error with OpenAI
+        if hasattr(last_message, "parsed") and last_message.parsed is not None:
+            exclusions.add("parsed")  # omit "parsed" in the data sent back to the API
+
         internal_messages.append(
             # make sure the history only has dict objects
-            last_message.model_dump(exclude_unset=True, exclude_none=True)
+            last_message.model_dump(exclude_unset=True, exclude_none=True, exclude=exclusions or None)
         )
 
-        if not last_message.tool_calls:
+        if last_message.tool_calls:
+            # there were tool calls, let's try to execute them
+            outcomes = await execute_tool_calls(
+                tool_calls=last_message.tool_calls,
+                openai_functions=openai_functions
+            )
+            if abbreviation_mode:
+                # track any (valid) function that the model tried to call
+                #  once we exit abbreviation mode, all of them need to be available
+                abbreviation_mode_attempted_calls |= set(
+                    outcome.tool_name for outcome in outcomes if outcome.tool_name is not None
+                )
+
+                # if we are still in abbreviation mode and all calls were successful:
+                #   turn off abbreviation mode
+                #   reset the message history to before the tool calls
+                #   but only allow the tool calls that were actually made
+                if not errors:
+                    # end loop early, cutting all of the abbreviated function calls from the message history
+                    internal_messages = internal_messages[:rewrite_cutoff]
+                    # TODO omitted_messages is misleading when this code branch is followed
+                    abbreviation_mode = False
+                    # however, also restrict the set of functions to those that the model actually tried to call
+                    available_function_names = abbreviation_mode_attempted_calls
+                    # on the next iteration, the model will now be able to choose only from these functions,
+                    #  but now with full definitions given
+                    continue
+
+            new_successful_instances = [outcome.result for outcome in outcomes if outcome.success]
+            new_successful_tool_calls = [outcome.raw_tool_call for outcome in outcomes if outcome.success]
+            new_successful_tool_responses = [outcome.to_response() for outcome in outcomes if outcome.success]
+            # Note: this may be a mixture of successful responses and errors
+            new_messages = [outcome.to_response() for outcome in outcomes]
+        elif hasattr(last_message, "parsed") and last_message.parsed is not None:
+            assert len(available_function_names) == 1
+            oai_fun_name, = available_function_names
+            oai_fun = openai_functions[oai_fun_name]
+            outcome = validate_structured_output(last_message, openai_function=oai_fun)
+            had_successful_structured_output = outcome.success
+            outcomes = [outcome]
+            # a structured response is actually not a tool call
+            new_successful_tool_calls = []
+            new_successful_tool_responses = []  # no need to turn these into responses
+            # we only generate a message when the structured output fails
+            new_messages = [outcome.to_response()] if not outcome.success else []
+            new_successful_instances = [outcome.result] if outcome.success else []
+        else:
             # no tool calls: just break the loop (we're done)
             break
-
-        # there were tool calls, let's try to execute them
-        outcomes = await execute_tool_calls(
-            tool_calls=last_message.tool_calls,
-            openai_functions=openai_functions
-        )
-
-        new_successful_instances = [outcome.result for outcome in outcomes if outcome.success]
-        new_successful_tool_calls = [outcome.raw_tool_call for outcome in outcomes if outcome.success]
-        new_successful_tool_responses = [outcome.to_response() for outcome in outcomes if outcome.success]
-        # Note: this may be a mixture of successful responses and errors
-        new_messages = [outcome.to_response() for outcome in outcomes]
 
         # 'errors' is overwritten intentionally, we only ever care about the errors of the last tool call(s)
         errors = [outcome.result for outcome in outcomes if not outcome.success]
 
-        if abbreviation_mode:
-            # track any (valid) function that the model tried to call
-            #  once we exit abbreviation mode, all of them need to be available
-            abbreviation_mode_attempted_calls |= set(
-                outcome.tool_name for outcome in outcomes if outcome.tool_name is not None
-            )
-
-            # if we are still in abbreviation mode and all calls were successful:
-            #   turn off abbreviation mode
-            #   reset the message history to before the tool calls
-            #   but only allow the tool calls that were actually made
-            if not errors:
-                # end loop early, cutting all of the abbreviated function calls from the message history
-                internal_messages = internal_messages[:rewrite_cutoff]
-                abbreviation_mode = False
-                # however, also restrict the set of functions to those that the model actually tried to call
-                available_function_names = abbreviation_mode_attempted_calls
-                # on the next iteration, the model will now be able to choose only from these functions,
-                #  but now with full definitions given
-                continue
-        else:
+        if not abbreviation_mode:
             # if we are not in abbreviation mode, we just track the outputs and go on to handle errors
             result_instances += new_successful_instances
             successful_tool_calls += new_successful_tool_calls
@@ -321,8 +378,8 @@ async def get_completion(
             internal_messages.append({
                 "role": "system",
                 "content": f"{num_failed}/{num_failed + num_successful} tool calls failed. "
-                           f"Please carefully recall the tool definition(s) and repeat all failed calls "
-                           f"(but only repeat the failed calls!)."
+                           f"Please carefully recall the supplied schema definition(s) and try again."
+                           f"If there were multiple calls, only repeat the failed ones!"
             })
             available_function_names = tool_names_for_next_attempt
         else:
@@ -335,7 +392,8 @@ async def get_completion(
         messages=internal_messages,
         rewrite_cutoff=rewrite_cutoff,
         successful_tool_calls=successful_tool_calls,
-        successful_tool_responses=successful_tool_responses
+        successful_tool_responses=successful_tool_responses,
+        had_successful_structured_output=had_successful_structured_output
     )
 
     final_error = None
@@ -369,6 +427,54 @@ class RawRequestSummary:
     tool_choice: ChatCompletionToolChoiceOptionParam | dict | NotGiven
 
 
+async def _call_openai_with_structured_outputs_if_possible(
+        messages: Messages,
+        model: str,
+        openai_client: AsyncOpenAI,
+        openai_functions: dict[str, OpenAIFunction],
+        available_function_names: set[str],
+        tool_choice_for_api_call: ChatCompletionToolChoiceOptionParam,
+        _track_raw_request_summaries: bool,
+        **kwargs
+) -> ChatCompletion | ParsedChatCompletion:
+    current_tools_by_name = {name: openai_functions[name].tool_definition for name in available_function_names}
+
+    response_format: type[BaseModel] | None = None
+    if tool_choice_for_api_call == "required" and len(current_tools_by_name) == 1:
+        response_format, = current_tools_by_name.values()  # take first and only tool
+    if tool_choice_for_api_call is not NOT_GIVEN and isinstance(tool_choice_for_api_call, dict):
+        tool_choice_for_api_call: ChatCompletionNamedToolChoiceParam
+        name_of_tool = tool_choice_for_api_call["function"]["name"]
+
+        if openai_functions[name_of_tool].was_defined_as_basemodel:
+            # if the tool was a function, we supply it via tools instead - OpenAI docs say that is best practice
+            response_format = openai_functions[name_of_tool].unvalidated_model
+
+    tools_for_api_call = list(current_tools_by_name.values()) or NOT_GIVEN
+    if response_format and structured_outputs_available(model_name=model):
+        # here we know that we definitely want the output to match one specific JSONSchema spec,
+        # so we can use structured outputs.
+        logging.debug("Using Structured Outputs without tool calling for this request.")
+        generated_completion: ParsedChatCompletion[response_format] = await openai_client.beta.chat.completions.parse(
+            messages=messages,
+            model=model,
+            response_format=response_format
+        )
+    else:
+        generated_completion: ChatCompletion = await openai_client.chat.completions.create(
+            messages=messages,
+            model=model,
+            tools=tools_for_api_call,
+            tool_choice=tool_choice_for_api_call,
+            **kwargs
+        )
+    if _track_raw_request_summaries:
+        generated_completion._raw_request_summary = RawRequestSummary(
+            messages=messages[:], tools=tools_for_api_call, tool_choice=tool_choice_for_api_call
+        )
+    return generated_completion
+
+
 async def _generate_one_completion(
         messages: Messages,
         openai_functions: dict[str, OpenAIFunction],
@@ -378,13 +484,12 @@ async def _generate_one_completion(
         openai_client: AsyncOpenAI,
         _track_raw_request_summaries: bool,
         **kwargs
-):
+) -> ChatCompletion | ParsedChatCompletion:
+    tool_choice_for_api_call: ChatCompletionToolChoiceOptionParam
     if tool_choice == DEFAULT_BEHAVIOR:
-        current_tool_choice = get_tool_choice_for_default_behavior(available_function_names)
+        tool_choice_for_api_call = get_tool_choice_for_default_behavior(available_function_names)
     else:
-        current_tool_choice = tool_choice
-
-    current_tools = [openai_functions[name].tool_definition for name in available_function_names] or NOT_GIVEN
+        tool_choice_for_api_call = tool_choice
 
     shortcut: ChatCompletionMessage | None = await maybe_shortcut_trivial_function_call(
         available_function_names,
@@ -394,20 +499,34 @@ async def _generate_one_completion(
     if shortcut is not None:
         generated_completion = ToolCallShortcut(message=shortcut)
     else:
-        generated_completion = await openai_client.chat.completions.create(
+        generated_completion = await _call_openai_with_structured_outputs_if_possible(
             messages=messages,
             model=model,
-            tools=current_tools,
-            tool_choice=current_tool_choice,
+            openai_client=openai_client,
+            openai_functions=openai_functions,
+            available_function_names=available_function_names,
+            tool_choice_for_api_call=tool_choice_for_api_call,
+            _track_raw_request_summaries=_track_raw_request_summaries,
             **kwargs
         )
 
-    if _track_raw_request_summaries:
-        generated_completion._raw_request_summary = RawRequestSummary(
-            messages=messages[:], tools=current_tools, tool_choice=current_tool_choice
-        )
     return generated_completion
 
+
+@dataclasses.dataclass
+class StructuredOutputOutcome:
+    success: bool
+    raw_content: str
+    result: BaseModelOrJsonCompatible | Exception
+    tool_name: str | None
+
+    def to_response(self) -> ChatCompletionSystemMessageParam:
+        if self.success:
+            raise ValueError("Shouldn't need to call to_response on a successful structured response.")
+        return ChatCompletionSystemMessageParam(
+            role="system",
+            content=f"Error: {self.result}"
+        )
 
 @dataclasses.dataclass
 class ToolCallOutcome:
@@ -425,8 +544,22 @@ class ToolCallOutcome:
         )
 
 
+def validate_structured_output(
+        message: ParsedChatCompletionMessage, openai_function: OpenAIFunction
+) -> StructuredOutputOutcome:
+    success = True
+    try:
+        result = openai_function.model(**message.parsed.model_dump())
+    except Exception as e:
+        result = e
+        success = False
+    return StructuredOutputOutcome(
+        success=success, raw_content=message.content, result=result, tool_name=openai_function.name
+    )
+
+
 async def execute_tool_calls(
-        tool_calls: list[ChatCompletionMessageToolCall], openai_functions
+        tool_calls: list[ChatCompletionMessageToolCall], openai_functions: dict[str, OpenAIFunction]
 ) -> list[ToolCallOutcome]:
     outcomes = []
     for tool_call in tool_calls:
@@ -590,13 +723,19 @@ def rewrite_message_history(
         rewrite_cutoff: int,
         successful_tool_calls: list[ChatCompletionMessageToolCall],
         successful_tool_responses: list[ChatCompletionToolMessageParam],
+        had_successful_structured_output: bool
 ):
     """
     Rewrite the history by removing all messages (not just the failed calls) and replacing them with a single clean
     multi call and its responses, starting from the cutoff index.
     """
-    omitted_messages = messages[rewrite_cutoff:]
+    omitted_messages = []
+    stashed_final_structured_output = None
+    if had_successful_structured_output:
+        stashed_final_structured_output = messages[-1]
+
     if successful_tool_calls:
+        omitted_messages = messages[rewrite_cutoff:-1 if stashed_final_structured_output else None]
         messages[rewrite_cutoff:] = [
             {
                 "role": "assistant",
@@ -605,5 +744,11 @@ def rewrite_message_history(
             },
             *successful_tool_responses
         ]
+    elif had_successful_structured_output:
+        omitted_messages = messages[rewrite_cutoff:-1]
+        messages[:] = messages[:rewrite_cutoff]
+
+    if stashed_final_structured_output:
+        messages.append(stashed_final_structured_output)
     return omitted_messages
 

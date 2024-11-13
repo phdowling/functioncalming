@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from functioncalming import get_completion, get_client
 from functioncalming.utils import ToolCallError
-from tests.conftest import MockOpenAI
+from tests.conftest import MockOpenAI, STRUCTURED_OUTPUTS_WERE_USED
 
 
 def get_weather(city: str, zip: str | None = None) -> str:
@@ -129,7 +129,7 @@ async def test_retry_happens():
 
 
 @pytest.mark.asyncio
-async def test_abbreviate():
+async def test_abbreviate(caplog):
 
     class GoodParam(BaseModel):
         """
@@ -150,13 +150,18 @@ async def test_abbreviate():
         """
         another_param: dict = Field(..., description="Especially if there are more parameters!")
 
-    def good_function(param: GoodParam) -> str:
+    class good_function(BaseModel):  # make this a basemodel so it will be called with structured outputs eventually
         """
         This is the function you need to call
         :param text: A text param
         :return:
         """
-        return str(param.number)
+        param: GoodParam
+
+        @property
+        def result(self):
+            return str(self.param.number)
+
 
     bad_tools = []
     for i in range(10):
@@ -180,7 +185,7 @@ async def test_abbreviate():
     assert unabbreviated_calm_response.success
     assert unabbreviated_calm_response.retries_done == 0
     assert len(unabbreviated_calm_response.raw_completions) == 1
-    assert unabbreviated_calm_response.tool_call_results[0] == "123"
+    assert unabbreviated_calm_response.tool_call_results[0].result == "123"
     unabbreviated_prompt_len = unabbreviated_calm_response.usage.prompt_tokens
     unabbreviated_cost = unabbreviated_calm_response.cost
 
@@ -196,10 +201,12 @@ async def test_abbreviate():
     assert abbreviated_calm_response.success
     assert abbreviated_calm_response.retries_done == 0
     assert len(abbreviated_calm_response.raw_completions) == 2
-    assert abbreviated_calm_response.tool_call_results[0] == "123"
+    assert abbreviated_calm_response.tool_call_results[0].result == "123"
 
     assert abbreviated_prompt_len < unabbreviated_prompt_len
     assert abbreviated_cost < unabbreviated_cost
+    assert STRUCTURED_OUTPUTS_WERE_USED in caplog.text
+
 
 
 

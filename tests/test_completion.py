@@ -92,7 +92,7 @@ async def test_simple():
                     "id": "1",
                     "type": "function",
                     "function": {
-                        "name": "situation",
+                        "name": "Situation",
                         "arguments": json.dumps(situation)
                     }
                 },
@@ -100,7 +100,7 @@ async def test_simple():
                     "type": "function",
                     "id": "2",
                     "function": {
-                        "name": "emoji_translation",
+                        "name": "EmojiTranslation",
                         "arguments": json.dumps({"translation": "idk lol"})
                     }
                 },
@@ -112,7 +112,7 @@ async def test_simple():
                 "type": "function",
                 "id": "3",
                 "function": {
-                    "name": "emoji_translation",
+                    "name": "EmojiTranslation",
                     "arguments": json.dumps({"translation": "🦊↗️🐶"})
                 }
             },
@@ -184,5 +184,23 @@ async def test_cost_tracking():
     assert calm_response.cost > 0
     assert calm_response.usage.total_tokens > 5
     assert calm_response.model.startswith("gpt-3.5-turbo")
+
+
+
+@pytest.mark.asyncio
+async def test_unknown_costs_tracking():
+    mock_client = MockOpenAI(get_client())
+    mock_client.add_next_responses(
+        ChatCompletionMessage(**{"role": "assistant", "content": "hello too"}), model="gpt-whatever"
+    )
+    calm_response = await get_completion(
+        system_prompt=None, user_message="Hello", model="gpt-whatever",
+        openai_client=mock_client
+    )
+
+    assert calm_response.cost == 0
+    assert calm_response.unknown_costs
+    assert calm_response.usage.total_tokens > 5
+    assert calm_response.model.startswith("gpt-whatever")
 
 

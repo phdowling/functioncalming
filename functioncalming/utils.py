@@ -46,7 +46,10 @@ class OpenAIFunction:
     name: str
     definition: FunctionDefinition
     callback: Callable[[...], Awaitable[BaseModel]]
+    unvalidated_model: type[BaseModel]
+    model: type[BaseModel]
     callback_expects_args_from_model: bool
+    was_defined_as_basemodel: bool
 
     @functools.cached_property
     def tool_definition(self) -> ChatCompletionToolParam:
@@ -57,14 +60,31 @@ class OpenAIFunction:
 def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
     # double check: do we need to iterate through the whole schema to find references to plain name and replace them?
     # could see this being the case for recursive models
-    name = pascal_to_snake(model_or_fn.__name__)
+
+    # todo is there any benefit to function-style naming?
+    # name = pascal_to_snake(model_or_fn.__name__)
+    was_defined_as_basemodel = False
+    name = model_or_fn.__name__
     description = model_or_fn.__doc__
+
     if description is None:
         logging.warning(f"Tool {model_or_fn} does not have a docstring! Model may not know how to use it.")
         description = ""
 
     if isinstance(model_or_fn, type) and issubclass(model_or_fn, BaseModel):
+        was_defined_as_basemodel = True
         as_model = model_or_fn
+        annotations = model_or_fn.__annotations__
+        # make a clone with no custom validators so OpenAI has a better shot of instantiating the model
+        as_unvalidated_model = create_model(
+            name,
+            **{
+                field_name: (annotations[field_name], field_info)
+                for field_name, field_info
+                in as_model.__fields__.items()
+            }
+        )  # clone, so we don't alter the original
+        as_unvalidated_model.model_config["extra"] = "forbid"
 
         async def callback(*args, **kwargs):  # this is just to always make the callback awaitable
             return model_or_fn(*args, **kwargs)
@@ -72,13 +92,18 @@ def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
     elif inspect.isfunction(model_or_fn):
         description, param_descriptions_from_docstring = description_and_param_docs_from_docstring(description)
         as_model = basemodel_from_function(
-            model_or_fn, name, param_descriptions_from_docstring
+            model_or_fn,
+            name,
+            param_descriptions_from_docstring
         )
+        as_unvalidated_model = as_model
         callback = create_callback_function_for_tool_use(model_or_fn, as_model)
     else:
         raise ValueError(f"Don't know how to turn {model_or_fn} into an OpenAI function")
 
+
     schema = as_model.model_json_schema()
+    schema["strict"] = True  # turns on structured outputs
 
     expects_args_from_model = bool(schema["properties"])
 
@@ -93,7 +118,10 @@ def create_openai_function(model_or_fn: BaseModel | Callable) -> OpenAIFunction:
             parameters=schema
         ),
         callback=callback,
-        callback_expects_args_from_model=expects_args_from_model
+        callback_expects_args_from_model=expects_args_from_model,
+        unvalidated_model=as_unvalidated_model,
+        model=as_model,
+        was_defined_as_basemodel=was_defined_as_basemodel
     )
 
 
@@ -137,13 +165,6 @@ def create_callback_function_for_tool_use(
         return res
 
     return callback
-
-
-# def compile_param_description(annotation, default, description_from_docstring):
-#     if description_from_docstring:
-#         return description_from_docstring
-#     if isinstance(default, FieldInfo) and default.description:
-#         return default.description
 
 
 def basemodel_from_function(model_or_fn, name, param_descriptions_from_docstring) -> type[BaseModel]:
