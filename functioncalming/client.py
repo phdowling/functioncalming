@@ -5,10 +5,12 @@ import uuid
 import json
 import logging
 import os
+from contextvars import ContextVar
 from typing import TextIO, Literal, Dict, Any
 from functools import cached_property
 
 from openai._types import NOT_GIVEN, NotGiven
+from openai.types.beta.threads.runs import tool_call
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_tool_call import Function
 from pydantic import BaseModel, ValidationError
@@ -19,6 +21,8 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatComplet
     ChatCompletionToolChoiceOptionParam, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, \
     ChatCompletionToolParam, ChatCompletionNamedToolChoiceParam, ParsedChatCompletion, ParsedChatCompletionMessage
 from openai.types.completion_usage import CompletionUsage
+
+from functioncalming.context import set_calm_context
 from functioncalming.utils import invoke_callback_function, FineTuningData, InnerValidationError, \
     create_openai_function, OpenAIFunction, ToolCallError, create_abbreviated_openai_function, \
     serialize_openai_function_result, log_finetuning_data, UNSET_PLACEHOLDER, rebuild_cached_models
@@ -45,11 +49,26 @@ def set_client(client: AsyncOpenAI):
 
 DEFAULT_BEHAVIOR = "default_behavior"
 
+def register_model(
+        model_name: str,
+        supports_structured_outputs: bool,
+        cost_per_1mm_input_tokens: float,
+        cost_per_1mm_output_tokens: float
+):
+    if supports_structured_outputs:
+        STRUCTURED_OUTPUTS_SUPPORTED.add(model_name)
+    COSTS_BY_MODEL[model_name] = (cost_per_1mm_input_tokens, cost_per_1mm_output_tokens)
+
+# for registering new models externally when I forget to update the library again
+STRUCTURED_OUTPUTS_SUPPORTED = set()
+
 
 def structured_outputs_available(model_name: str):
     if model_name == "gpt-4o-2024-05-13":
         return False
-    return model_name.startswith('o1') or model_name.startswith('gpt-4o')
+    if model_name in STRUCTURED_OUTPUTS_SUPPORTED:
+        return True
+    return model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('gpt-4o')
 
 
 # cost per 1MM token
@@ -219,6 +238,13 @@ async def get_completion(
     :param kwargs: Other keyword arguments to pass to the OpenAI completions API call
     :return: a CalmResponse object
     """
+    if model not in COSTS_BY_MODEL:
+        logging.warning(
+            f"Model {model} is not (yet) known to functioncalming. "
+            f"Cost tracking may be unavailable, and even if structured outputs are supported, they may be deactivated. "
+            "To fix this, call register_model() with the appropriate settings for your model. "
+        )
+
     # make a copy, we do not edit the passed-in message history
     internal_messages = messages[:] if messages is not None else []
     retries = max(0, retries)
@@ -454,6 +480,7 @@ async def _call_openai_with_structured_outputs_if_possible(
         available_function_names
     )
     if name_of_only_tool is not None and openai_functions[name_of_only_tool].was_defined_as_basemodel:
+        # if there is only one tool and it was defined as a BaseModel, we use response_format
         # if the tool was a function, we supply it via tools instead - OpenAI docs say that is best practice
         response_format = openai_functions[name_of_only_tool].non_validating_model
 
@@ -573,7 +600,6 @@ async def validate_structured_output(
         tool_name=openai_function.name
     )
 
-
 async def execute_tool_calls(
         tool_calls: list[ChatCompletionMessageToolCall], openai_functions: dict[str, OpenAIFunction]
 ) -> list[ToolCallOutcome]:
@@ -611,7 +637,11 @@ async def execute_tool_calls(
             continue
 
         try:
-            result_instance = await openai_function.callback(**arguments)
+            with set_calm_context(
+                tool_call=tool_call,
+                openai_function=openai_function,
+            ):
+                result_instance = await openai_function.callback(**arguments)
             outcomes.append(
                 ToolCallOutcome(
                     success=True,

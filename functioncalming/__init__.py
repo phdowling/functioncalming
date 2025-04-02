@@ -1,1 +1,1 @@
-from .client import get_client, set_client, get_completion, CalmResponse
+from .client import get_client, set_client, get_completion, CalmResponse, register_model

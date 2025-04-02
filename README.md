@@ -14,8 +14,7 @@ functioncalming comes with support for:
 - Automatically passing function/tool results back to the model
 - Automatic message history re-writing to hide failed function calls that were re-tried
 - Create fine-tuning data to make model better at calling your functions/models with near zero config
-- Create fine-tuning data for distilling a complex pipeline to a simple model via a simple decorator (`@distillery`)
-- Reporting the cost of your API requests (using OpenAI pricing as of April 2024)
+- Reporting the cost of your API requests (where possible)
 
 ## Who is this for?
 Basically, functioncalming provides useful utilities for any case where you find yourself using function calling in OpenAI. 
@@ -90,32 +89,3 @@ What functioncalming provides here is a simple interface to "clean up" and augme
 have the correct format for the student fine-tuning task with no custom data cleaning scripts required.
 
 TODO - show how to set up a distillation pipeline.
-
-## functioncalming and instructor
-Credit where it's due: functioncalming takes inspiration from https://github.com/jxnl/instructor and serves the same basic purpose.
-
-It's an alternative (or supplement) to `instructor` that is opinionated in a different way and has (probably) slightly different priorities: 
-ease of use, exposing all features of the function calling API, and providing tools for improving function calling performance and reliability.
-
-A few differences vs instructor (as of early December 2023):
-- Message history re-writing (i.e. hiding failed function call attempts from the model in subsequent calls / fine-tuning data)
-  - This tends to make subsequent calls more likely to succeed if you continue sending more messages in the same conversation
-  - It also makes the resulting message history more suitable for fine-tuning
-- functioncalming avoids supplying/hard-coding fixed prompts (almost everywhere), while instructor has hard-coded prompts in a few places
-  - This is not necessarily an advantage or disadvantage per se - in my own work I just prefer being able to customize prompts everywhere 
-- Support for multiple response models (i.e. multiple tool calls) in a single completion call
-- Support for multiple returned response objects (i.e. parallel tool calls, independent of whether multiple models were used)
-- functioncalming handles calling functions directly and returns results
-  - in instructor (from my understanding) you need to invoke the functions yourself, but it ships some helpers for doing this 
-  - It also handles returning extraction/function results back to the model (not particularly difficult, but one less thing to code yourself)
-- functioncalming provides its own get_completion method instead of monkey-patching OpenAI
-  - not really a feature, just opinionation
-  - note: it still exposes all underlying settings and config of the `openai` library via kwargs
-- both libraries help with distillation, but again with different approaches/APIs (and instructor goes further with CLI utilities for triggering training runs, etc.)
-- functioncalming does not ship LLM-validators for pydantic (but in principle, those from instructor should work with functioncalming)
-- functioncalming does not, in its current release, support json-mode or legacy function calling as its underlying mechanisms
-- Currently, instructor has much nicer docs and is probably better supported :)
-
-It might make sense to use both libraries together. functioncalming does not handle many of the features instructor provides (e.g. LLM-based pydantic validators, fine-tuning CLI, etc.). 
-If your use-case is simply to call OpenAI with multiple functions and/or to generate fine-tuning/distillation training data for a repeatable function-calling task, 
-functioncalming might be a more straightforward option. 

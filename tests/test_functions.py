@@ -1,12 +1,14 @@
 import io
 
 import json
+import logging
 
 import pytest
 from openai.types.chat import ChatCompletionMessage
 from pydantic import BaseModel, Field
 
 from functioncalming import get_completion, get_client
+from functioncalming.context import calm_context, CalmContext
 from functioncalming.utils import ToolCallError
 from tests.conftest import MockOpenAI, STRUCTURED_OUTPUTS_WERE_USED
 
@@ -22,6 +24,8 @@ def get_weather(city: str, zip: str | None = None) -> str:
 
 
 def get_time(city: str, zip_code: str | None = None) -> str:
+    context: CalmContext = calm_context.get()
+    logging.info(context.tool_call.function.name)
     return "7pm"
 
 
@@ -33,6 +37,15 @@ async def test_simple_function_call():
     )
     assert "snow" in json.dumps(calm_response.messages)
     assert calm_response.tool_call_results[0] == "lots of snow"
+
+
+@pytest.mark.asyncio
+async def test_context(caplog):
+    calm_response = await get_completion(
+        user_message="What time is it?",
+        tools=[get_weather, get_time],
+    )
+    assert 'get_time' in caplog.text
 
 
 @pytest.mark.asyncio

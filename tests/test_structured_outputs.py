@@ -68,7 +68,7 @@ async def test_structured_outputs_are_not_used_in_older_models(caplog):
 @pytest.mark.asyncio
 async def test_field_info_gets_adjusted():
     class Joke(BaseModel):
-        joke: str = Field(..., description="A joke. Must be the same type of joke as the example.", examples=["Knock knock?\n> Who's there? Interrupting cow! > Interrupting cow wh-MOOOOOO"])
+        joke: str = Field(..., description="A joke. **Must be the same genre** of joke as the example.", examples=["Knock knock?\n> Who's there? Interrupting cow! > Interrupting cow wh-MOOOOOO"])
         another_field: str = Field(..., description="This field MUST contain the string literal 'sudo' for the response to be valid.")
 
     calm_response = await get_completion(

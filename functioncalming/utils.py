@@ -81,7 +81,7 @@ class OpenAIFunction:
 
 
 UNSET_PLACEHOLDER = "__UNSET"
-_model_cache: dict[str, type[BaseModel]] = {}
+_model_cache: dict[type[BaseModel], type[BaseModel]] = {}
 
 
 def adjust_annotation_model_references(
@@ -119,6 +119,11 @@ def adjust_field_info_for_openai(
 ):
     field_info = FieldInfo.merge_field_infos(field_info)  # makes a copy
 
+    # TODO remove unsupported constraints like length, greater/less than, etc. see here
+    #  https://openai.com/index/introducing-structured-outputs-in-the-api/
+    #  and
+    #  https://platform.openai.com/docs/guides/structured-outputs
+
     # make sure all references to BaseModels are the OpenAI-adjusted variant
     annotation = adjust_annotation_model_references(field_info.annotation, _forward_declarations)
 
@@ -142,6 +147,7 @@ def adjust_field_info_for_openai(
             ]
         ).strip()
         field_info.examples = None
+
     return annotation, field_info
 
 
@@ -184,6 +190,9 @@ def create_openai_function(model_or_fn: BaseModel | Callable, keep_in_model_cach
     was_defined_as_basemodel = False
     name = model_or_fn.__name__
     description = model_or_fn.__doc__
+
+    # TODO support arbitrary type definitions like unions? We could automatically wrap the types that OpenAI does not
+    #  directly support in a class like Output(result=...) and unpack it before we return it to the user
 
     if description is None:
         logging.warning(f"Tool {model_or_fn} does not have a docstring! Model may not know how to use it.")
@@ -229,7 +238,7 @@ def create_abbreviated_openai_function(model_or_fn: Callable | BaseModel) -> Ope
     return create_openai_function(stub, keep_in_model_cache=False)
 
 
-def description_and_param_docs_from_docstring(function_docstring):
+def description_and_param_docs_from_docstring(function_docstring) -> tuple[str, dict[str, str]]:
     param_descriptions = {}
     description = function_docstring
     if function_docstring is not None:
