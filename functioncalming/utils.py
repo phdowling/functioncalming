@@ -8,7 +8,7 @@ import functools
 import inspect
 import json
 from inspect import Parameter
-from pydantic_core import PydanticUndefined
+from pydantic_core import PydanticUndefined, to_jsonable_python
 from types import MappingProxyType
 from typing import Callable, Awaitable, TextIO, Literal, get_origin, get_args, ForwardRef, Union
 
@@ -170,7 +170,7 @@ def get_or_make_adjusted_model_for_openai(
                 _forward_declarations=_forward_declarations
             )
             for field_name, field_info
-            in model.__fields__.items()
+            in model.model_fields.items()
         }
     )  # clone, so we don't alter the original
     non_validating_model.model_config["extra"] = "forbid"
@@ -304,23 +304,7 @@ def basemodel_from_function(model_or_fn, name, param_descriptions_from_docstring
 
 
 def serialize_openai_function_result(result: BaseModelOrJsonCompatible):
-    if isinstance(result, (BaseModel, RootModel)):
-        return result.model_dump_json()
-    return json.dumps(result)
-
-
-async def invoke_callback_function(
-        openai_function: OpenAIFunction,
-        kwargs: dict,
-) -> tuple[BaseModel, str]:
-    result = await openai_function.callback(**kwargs)
-
-    if isinstance(result, (BaseModel, RootModel)):
-        serialized = result.model_dump_json()
-    else:
-        serialized = json.dumps(result)
-
-    return result, serialized
+    return json.dumps(to_jsonable_python(result))
 
 
 class FineTuningData(BaseModel, extra="allow"):

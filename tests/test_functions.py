@@ -2,10 +2,11 @@ import io
 
 import json
 import logging
+from typing import Any
 
 import pytest
 from openai.types.chat import ChatCompletionMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 
 from functioncalming import get_completion, get_client
 from functioncalming.context import calm_context, CalmContext
@@ -28,6 +29,11 @@ def get_time(city: str, zip_code: str | None = None) -> str:
     logging.info(context.tool_call.function.name)
     return "7pm"
 
+class Something(BaseModel):
+    field: str = "Hello World"
+
+def returns_list() -> list[list[Something]]:
+    return [[Something()]]
 
 @pytest.mark.asyncio
 async def test_simple_function_call():
@@ -37,6 +43,17 @@ async def test_simple_function_call():
     )
     assert "snow" in json.dumps(calm_response.messages)
     assert calm_response.tool_call_results[0] == "lots of snow"
+
+
+@pytest.mark.asyncio
+async def test_nested_result():
+    calm_response = await get_completion(
+        user_message="Hello",
+        tools=[returns_list],
+        tool_choice='required'
+    )
+    res: list[list[Something]] = calm_response.tool_call_results[0]
+    assert res[0][0].field == "Hello World"
 
 
 @pytest.mark.asyncio

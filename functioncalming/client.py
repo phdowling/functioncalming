@@ -1,16 +1,13 @@
 import dataclasses
-import functools
 import uuid
 
 import json
 import logging
 import os
-from contextvars import ContextVar
-from typing import TextIO, Literal, Dict, Any
+from typing import TextIO, Literal
 from functools import cached_property
 
 from openai._types import NOT_GIVEN, NotGiven
-from openai.types.beta.threads.runs import tool_call
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_tool_call import Function
 from pydantic import BaseModel, ValidationError
@@ -18,14 +15,14 @@ from openai import AsyncOpenAI
 
 from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall, \
     ChatCompletionToolMessageParam, ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam, \
-    ChatCompletionToolChoiceOptionParam, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, \
+    ChatCompletionToolChoiceOptionParam, ChatCompletionAssistantMessageParam, \
     ChatCompletionToolParam, ChatCompletionNamedToolChoiceParam, ParsedChatCompletion, ParsedChatCompletionMessage
 from openai.types.completion_usage import CompletionUsage
 
 from functioncalming.context import set_calm_context
-from functioncalming.utils import invoke_callback_function, FineTuningData, InnerValidationError, \
+from functioncalming.utils import InnerValidationError, \
     create_openai_function, OpenAIFunction, ToolCallError, create_abbreviated_openai_function, \
-    serialize_openai_function_result, log_finetuning_data, UNSET_PLACEHOLDER, rebuild_cached_models
+    serialize_openai_function_result, log_finetuning_data, rebuild_cached_models
 from functioncalming.types import BaseModelOrJsonCompatible, Messages, BaseModelFunction
 
 _client = None

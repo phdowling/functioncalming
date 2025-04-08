@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "functioncalming"
-version = "0.0.11"
+version = "0.0.12"
 description = "Robust and reliable OpenAI function calling"
 authors = ["Philipp Dowling <phdowling@users.noreply.github.com>"]
 license = "MIT"
