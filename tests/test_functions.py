@@ -2,16 +2,16 @@ import io
 
 import json
 import logging
-from typing import Any
 
 import pytest
 from openai.types.chat import ChatCompletionMessage
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field
 
 from functioncalming import get_completion, get_client
+from functioncalming.client import USING_STRUCTURED_OUTPUTS
 from functioncalming.context import calm_context, CalmContext
 from functioncalming.utils import ToolCallError
-from tests.conftest import MockOpenAI, STRUCTURED_OUTPUTS_WERE_USED
+from tests.conftest import MockOpenAI
 
 
 def get_weather(city: str, zip: str | None = None) -> str:
@@ -235,7 +235,7 @@ async def test_abbreviate(caplog):
 
     assert abbreviated_prompt_len < unabbreviated_prompt_len
     assert abbreviated_cost < unabbreviated_cost
-    assert STRUCTURED_OUTPUTS_WERE_USED in caplog.text
+    assert USING_STRUCTURED_OUTPUTS in caplog.text
 
 
 

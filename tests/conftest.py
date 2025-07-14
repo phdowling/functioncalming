@@ -73,4 +73,4 @@ class MockOpenAI:
         self.chat.completions.next_responses += completions
 
 
-STRUCTURED_OUTPUTS_WERE_USED = "Using Structured Outputs without tool calling for this request."
+

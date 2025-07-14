@@ -171,7 +171,7 @@ async def test_no_function():
         user_message="Call `echo` with the argument 'Hello'", tools=[echo]
     )
     assert calm_response.tool_call_results[0] == "Hello"
-    assert calm_response.last_message['content'] == '"Hello"'
+    assert calm_response.last_message['content'] == "Hello"
     assert calm_response.last_message['role'] == 'tool'
 
 

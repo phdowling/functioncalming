@@ -1,17 +1,26 @@
 [tool.poetry]
 name = "functioncalming"
-version = "0.0.12"
-description = "Robust and reliable OpenAI function calling"
+version = "0.0.15"
+description = "Robust and reliable OpenAI tool calling"
 authors = ["Philipp Dowling <phdowling@users.noreply.github.com>"]
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/phdowling/functioncalming"
 repository = "https://github.com/phdowling/functioncalming"
-keywords = ["openai", "function-calling", "distillation", "fine-tuning", "pydantic", "validation", "llm"]
+keywords = [
+    "openai",
+    "function-calling",
+    "pydantic",
+    "validation",
+    "llm",
+    "tool-calling",
+    "retry",
+    "structured-ouputs"
+]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-openai = "^1.3.7"
+openai = "^1.95.1"
 pydantic = "^2.5.2"
 docstring-parser = "^0.16"
 

@@ -1,91 +1,74 @@
 # functioncalming
+Get near-guaranteed structured responses from OpenAI models using pydantic and tool calling / structured outputs.
+
+This library provides a convenience wrapper to avoid certain repetitive patterns that I often ended up reimplementing when using the OpenAI library directly.
 ## Installation
 `pip install functioncalming`
 
-## Overview
-Get (near-)guaranteed structured responses from OpenAI using pydantic and function calling (and, if you like, fine-tuning).
-
-functioncalming uses OpenAI's function calling in combination with pydantic model validation to hide away the messy details of getting structured responses from an LLM.
-
-functioncalming comes with support for:
-- Structured responses from the LLM via pydantic models
-- Structured responses from the LLM via plain python function (pydantic argument validation happens under the hood)
-- Parallel function calling, as well as giving the model a choice of multiple different tools
-- Automatically passing function/tool results back to the model
-- Automatic message history re-writing to hide failed function calls that were re-tried
-- Create fine-tuning data to make model better at calling your functions/models with near zero config
-- Reporting the cost of your API requests (where possible)
-
-## Who is this for?
-Basically, functioncalming provides useful utilities for any case where you find yourself using function calling in OpenAI. 
-However, it particularly shines in use-cases where any of the following are the case:
-- LLM responses are consumed in a mostly machine-facing way (i.e. the output of the LLM is used in a workflow instead of direct conversation with a user)
-- LLMs are used for data extraction, i.e. you just want to extract a possibly complex and nested structured object from an input (rather than just calling e.g. a simple `get_weather()`-style function)
-- The same function(s) are called over and over again, and you want to fine-tune a cheaper model to reach the level of quality that GPT-4 offers
-- A cheaper (e.g. `gpt-3.5-turbo`) model should be fine-tuned (**distilled**) to perform the task of a complex pipeline based on an expensive model (e.g. `gpt-4`) directly
-
-## Usage
-Simple example of calling two functions in parallel (may be flaky using a real model, but this is how parallel calls are done):
-
+## Example
 ```python
-from pydantic import BaseModel
-from functioncalming.client import get_completion
+from functioncalming import get_completion
+from pydantic import BaseModel, field_validator
+import datetime
+import asyncio
 
 
-class Actor(BaseModel):
-    """
-    A person or non-human actor involved in a situation
-    """
-    name: str
-    adjectives: list[str]
+def get_weather(city: str, postal_code: str | None = None) -> str:
+    return "pretty sunny"
 
 
-class Situation(BaseModel):
-    """
-    A situation or event involving a number of actors
-    """
-    actors: list[Actor]
-    action: str
+def get_time(city: str, zip_code: str | None = None) -> datetime.datetime:
+    return datetime.datetime.now()
 
+# tools passed in as BaseModel-derived classes will use Structured Outputs
+class AddressInMunich(BaseModel):
+    street: str
+    city: str
+    postal_code: str
 
-class EmojiTranslation(BaseModel):
-    translation: str
-
-
-PROMPT = """You help extract cleaned data from unstructured input text 
-and simultaneously (but separately) turn the text into an Emoji-translation.
-You also have a tendency to always make a mistake the first time you call a function, but then do it correctly.
-"""
-
-history = [
-    {'role': 'system', 'content': PROMPT},
-    {'role': 'user', 'content': "The quick brown fox jumps over the lazy dog"}
-]
-
+    @field_validator('postal_code')
+    def validate_zip(cls, value):
+        if not str(value).startswith('80') or str(value).startswith('81'):
+            raise ValueError("Munich postal codes start with 80 or 81")
+        return value
 
 async def main():
     calm_response = await get_completion(
-        messages=history,
-        tools=[Situation, EmojiTranslation],
-        temperature=0,
-        retries=1,
-        rewrite_log_destination='finetune.jsonl', 
+        user_message="What's the weather like in Munich?",
+        # tools can be python functions or Pydantic models
+        tools=[get_weather, get_time, AddressInMunich],
+        model="gpt-4.1",
     )
-    print(calm_response.success)
-    print(calm_response.retries_done)
-    print(calm_response.usage)  # total tokens used 
-    print(calm_response.cost)  # estimated dollar cost of all requests that were done
-    print(calm_response.tool_call_results[0].model_dump_json(
-        indent=4))  # {"actors": [{"name": "fox", "adjectives": ["quick", "brown"]}, {"name": "dog", "adjectives": ["lazy"]}], "action": "jumping over"}
-    print(calm_response.tool_call_results[1].model_dump_json(indent=4))  # {"translation": "🦊↗️🐶"}
-    print(f"Clean, rewritten history: {len(calm_response.messages)} messages. Real history: {len(calm_response.messages_raw)} messages.")
+    # tools are called automatically and their results are accessible on the CalmResponse object 
+    # tool_call_results is a list because the model may call multiple tools in parallel
+    assert calm_response.tool_call_results[0] == "pretty sunny"
+    # calm_response.messages is the rewritten message history (rewritten to hide retries)
+    # the tool response message also gets generated and appended here
+    assert "sunny" in calm_response.messages[-1]['content']
+
+    calm_response_2 = await get_completion(
+        user_message="Make up a random address in Munich (using the appropriate tool)",
+        tools=[get_weather, get_time, AddressInMunich],
+        model="gpt-4.1",
+    )
+    postal_code = str(calm_response_2.tool_call_results[0].postal_code)
+    assert postal_code.startswith("80") or postal_code.startswith("81")
+    
+    print(f"Cost: ${calm_response.cost + calm_response_2.cost}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
-## Generating fine-tuning data for distillation
-functioncalming tries to make it easy to generate data for function distillation - i.e. fine-tuning a cheaper, faster "student" pipeline
-to perform a complex task that can be reliably achieved using a more expensive, slower "teacher" pipeline. The ideas is to track the inputs 
-and outputs of the teacher pipeline and use them to train the student pipeline to perform the task directly.
 
-What functioncalming provides here is a simple interface to "clean up" and augment the message history of the teacher pipeline to 
-have the correct format for the student fine-tuning task with no custom data cleaning scripts required.
-
-TODO - show how to set up a distillation pipeline.
+## Feature overview
+Main additions over OpenAI's own tool calling:
+- Allows you to specify validators when using pydantic models e.g. to enforce semantics
+- Automatic retries with message history cleaning
+  - when the model fails to call the tool / model correctly, the error will be shown to the model for (a configurable number of) retries
+  - those retries are automaticallly hidden in the "main" returned chat history, it will look like the model simply called the tool correctly the first time around
+- Use plain python functions as tools
+- When the model calls them, tools are actually invoked, their response messages generated and added to the result history
+- Responses are wrapped in a useful CalmResponse object that neatly exposes the new message history, tool calling results, token counts, best-effort costs, etc.
+- Tool abbreviation
+  - If your tools generate large JSON schemas and they fill up a lot of your context window, you can "abbreviate" the tools
+  - The model will then only be shown the tool without parameters, and once it tries to invoke the tool, the chat is replayed with only that tool available and its full documentation for the model to properly call it

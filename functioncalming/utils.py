@@ -10,15 +10,15 @@ import json
 from inspect import Parameter
 from pydantic_core import PydanticUndefined, to_jsonable_python
 from types import MappingProxyType
-from typing import Callable, Awaitable, TextIO, Literal, get_origin, get_args, ForwardRef, Union
+from typing import Callable, Awaitable, Literal, get_origin, get_args, ForwardRef, Union
 
 from docstring_parser import parse, Docstring
-from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam, ChatCompletionMessage
+from openai.types.chat import ChatCompletionToolParam
 from openai.types.shared_params import FunctionDefinition
-from pydantic import BaseModel, RootModel, create_model, Field, ValidationError
+from pydantic import BaseModel, create_model, Field, ValidationError
 from pydantic.fields import FieldInfo
 
-from functioncalming.types import BaseModelOrJsonCompatible, Messages
+from functioncalming.types import JsonCompatible, EscapedOutput
 
 
 def pascal_to_snake(pascal_string):
@@ -80,7 +80,8 @@ class OpenAIFunction:
         return ChatCompletionToolParam(type="function", function=self.definition)
 
 
-UNSET_PLACEHOLDER = "__UNSET"
+type UnsetPlaceholder = Literal["__UNSET"]
+UNSET_PLACEHOLDER: UnsetPlaceholder = "__UNSET"
 _model_cache: dict[type[BaseModel], type[BaseModel]] = {}
 
 
@@ -130,7 +131,7 @@ def adjust_field_info_for_openai(
     # get rid of any actual default value, but allow model to place a default placeholder token
     if field_info.default is not PydanticUndefined:
         field_info.default = PydanticUndefined
-        annotation = annotation | Literal[UNSET_PLACEHOLDER]
+        annotation = annotation | UnsetPlaceholder
         field_info.description = "\n".join(
             [
                 field_info.description or '',
@@ -284,7 +285,7 @@ def create_callback_function_for_tool_use(
 
 
 def basemodel_from_function(model_or_fn, name, param_descriptions_from_docstring) -> type[BaseModel]:
-    # TypeAdapter(model_or_fn) might be suitable too - unfortunately it doesn't care about docstrings
+    # TypeAdapter(model_or_fn) would be suitable too - unfortunately it doesn't care about docstrings
     params: MappingProxyType[str, Parameter] = inspect.signature(model_or_fn).parameters
     as_model = create_model(
         name,
@@ -303,37 +304,12 @@ def basemodel_from_function(model_or_fn, name, param_descriptions_from_docstring
     return as_model
 
 
-def serialize_openai_function_result(result: BaseModelOrJsonCompatible):
-    return json.dumps(to_jsonable_python(result))
+def serialize_openai_function_result(result: JsonCompatible | EscapedOutput):
+    if isinstance(result, EscapedOutput):
+        result = result.result_for_model
 
+    if not isinstance(result, str):
+        # if the function returns a str, just return it verbatim
+        result = json.dumps(to_jsonable_python(result))
 
-class FineTuningData(BaseModel, extra="allow"):
-    messages: Messages
-    # todo: update this to Tool as soon as finetuning does not require legacy format anymore
-    #  https://platform.openai.com/docs/guides/fine-tuning/fine-tuning-examples
-    functions: list[FunctionDefinition]
-
-
-
-def log_finetuning_data(
-        destination: str | TextIO,
-        messages: Messages,
-        functions: list[OpenAIFunction],
-        extra_data: dict | None = None
-):
-    if extra_data is not None and "messages" in extra_data:
-        logging.warning("'messages' key is being overwritten by extra data!")
-
-    if extra_data is not None and "functions" in extra_data:
-        logging.warning("'functions' key is being overwritten by extra data!")
-
-    fd = FineTuningData(
-        **{**dict(messages=messages, functions=[t.definition for t in functions]), **(extra_data or {})}
-    )
-
-    log_entry = f"{fd.model_dump_json()}\n"
-    if isinstance(destination, str):
-        with open(destination, "a") as outf:
-            outf.write(log_entry)
-    else:
-        destination.write(log_entry)
+    return result

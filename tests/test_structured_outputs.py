@@ -1,8 +1,12 @@
+import dataclasses
+from typing import Any
+
 import pytest
 from pydantic import BaseModel, field_validator, Field, ConfigDict
 
 from functioncalming import get_completion
-from tests.conftest import STRUCTURED_OUTPUTS_WERE_USED
+from functioncalming.client import USING_STRUCTURED_OUTPUTS
+from functioncalming.types import EscapedOutput
 
 
 @pytest.mark.asyncio
@@ -33,7 +37,7 @@ async def test_structured_outputs_are_used(caplog):
 
     assert isinstance(calm_response.tool_call_results[0], MyStructuredOutput)
 
-    assert STRUCTURED_OUTPUTS_WERE_USED in caplog.text
+    assert USING_STRUCTURED_OUTPUTS in caplog.text
 
 
 @pytest.mark.asyncio
@@ -62,7 +66,7 @@ async def test_structured_outputs_are_not_used_in_older_models(caplog):
 
     assert isinstance(calm_response.tool_call_results[0], MyStructuredOutput)
 
-    assert STRUCTURED_OUTPUTS_WERE_USED not in caplog.text
+    assert USING_STRUCTURED_OUTPUTS not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -101,4 +105,28 @@ async def test_defaults_work():
     )
 
     assert calm_response.tool_call_results[0].leave_blank is obj
+
+@pytest.mark.asyncio
+async def test_escaping_output():
+    def gen():
+        i = 0
+        while True:
+            yield i
+            i += 1
+
+
+    def my_tool():
+        return EscapedOutput(data=gen(), result_for_model='Okay!')
+
+    calm_response = await get_completion(
+        system_prompt=None,
+        user_message="Call my_tool",
+        tools=[my_tool],
+        retries=1,
+        model="gpt-4o-mini"
+    )
+    res = calm_response.tool_call_results[0]
+    assert next(res.data) == 0
+    assert res.result_for_model == 'Okay!'
+    assert calm_response.messages[-1]['content'] == "Okay!"
 

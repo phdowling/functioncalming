@@ -4,7 +4,9 @@ import uuid
 import json
 import logging
 import os
-from typing import TextIO, Literal
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Literal
 from functools import cached_property
 
 from openai._types import NOT_GIVEN, NotGiven
@@ -22,14 +24,16 @@ from openai.types.completion_usage import CompletionUsage
 from functioncalming.context import set_calm_context
 from functioncalming.utils import InnerValidationError, \
     create_openai_function, OpenAIFunction, ToolCallError, create_abbreviated_openai_function, \
-    serialize_openai_function_result, log_finetuning_data, rebuild_cached_models
-from functioncalming.types import BaseModelOrJsonCompatible, Messages, BaseModelFunction
+    serialize_openai_function_result, rebuild_cached_models
+from functioncalming.types import Messages, JsonCompatibleFunction, JsonCompatible
 
-_client = None
+USING_STRUCTURED_OUTPUTS = "Using Structured Outputs without tool calling for this request."
+
+_openai_client: ContextVar[AsyncOpenAI | None] = ContextVar('_openai_client', default=None)
 
 
 def get_client():
-    global _client
+    _client = _openai_client.get()
     if not _client:
         _client = AsyncOpenAI(
             api_key=os.environ.get("OPENAI_API_KEY"),
@@ -38,13 +42,14 @@ def get_client():
         )
     return _client
 
+@contextmanager
+def set_openai_client(client: AsyncOpenAI):
+    token = _openai_client.set(client)
+    yield
+    _openai_client.reset(token)
 
-def set_client(client: AsyncOpenAI):
-    global _client
-    _client = client
-
-
-DEFAULT_BEHAVIOR = "default_behavior"
+type DefaultBehavior = Literal['default_behavior']
+DEFAULT_BEHAVIOR: DefaultBehavior = "default_behavior"
 
 def register_model(
         model_name: str,
@@ -104,6 +109,46 @@ COSTS_BY_MODEL = {
     "gpt-3.5-turbo-16k": (3., 4.),
 }
 
+# TODO refactor these
+for model_name in ('gpt-4.1', 'gpt-4.1-2025-04-14'):
+    register_model(
+        model_name=model_name,
+        supports_structured_outputs=True,
+        cost_per_1mm_input_tokens=2.0,
+        cost_per_1mm_output_tokens=8.0,
+    )
+for model_name in ('gpt-4.1-mini', 'gpt-4.1-mini-2025-04-14'):
+    register_model(
+        model_name=model_name,
+        supports_structured_outputs=True,
+        cost_per_1mm_input_tokens=0.4,
+        cost_per_1mm_output_tokens=1.6,
+    )
+
+for model_name in ('gpt-4.1-nano', 'gpt-4.1-nano-2025-04-14'):
+    register_model(
+        model_name=model_name,
+        supports_structured_outputs=True,
+        cost_per_1mm_input_tokens=0.1,
+        cost_per_1mm_output_tokens=0.4,
+    )
+
+for model_name in ('gpt-4o', 'gpt-4o-2024-08-06'):
+    register_model(
+        model_name=model_name,
+        supports_structured_outputs=True,
+        cost_per_1mm_input_tokens=2.5,
+        cost_per_1mm_output_tokens=10.0,
+    )
+
+for model_name in ('gpt-4o-mini', 'gpt-4o-mini-2024-07-18'):
+    register_model(
+        model_name=model_name,
+        supports_structured_outputs=True,
+        cost_per_1mm_input_tokens=.15,
+        cost_per_1mm_output_tokens=.6,
+    )
+
 
 class ToolCallShortcut:
     def __init__(self, message: ChatCompletionMessage):
@@ -115,9 +160,9 @@ class ToolCallShortcut:
 
 
 @dataclasses.dataclass
-class CalmResponse:
+class CalmResponse[T: JsonCompatible]:
     success: bool
-    tool_call_results: list[BaseModelOrJsonCompatible]
+    tool_call_results: list[T]
     messages: Messages
     error: Exception | None
     retries_done: int
@@ -192,22 +237,20 @@ class CalmResponse:
         return model, total_cost, usage, some_cost_unknown
 
 
-async def get_completion(
+async def get_completion[T: JsonCompatible](
         messages: Messages | None = None,
         system_prompt: str | None = None,
         user_message: str | None = None,
-        tools: list[type[BaseModel] | BaseModelFunction] | None = None,
-        tool_choice: Literal[DEFAULT_BEHAVIOR] | ChatCompletionToolChoiceOptionParam = DEFAULT_BEHAVIOR,
+        tools: list[type[T] | JsonCompatibleFunction[T]] | None = None,
+        tool_choice: DefaultBehavior | ChatCompletionToolChoiceOptionParam = DEFAULT_BEHAVIOR,
+        model: Literal["gpt-3.5-turbo", "gpt-4-1106-preview"] | str = None,
+        retries: int = 0,
+        openai_client: AsyncOpenAI | None = None,
         abbreviate_tools: bool = False,
         abbreviation_system_prompt: str | None = "Shortcut tool calling active! If calling tools, omit arguments.",
-        retries: int = 0,
-        rewrite_log_destination: str | TextIO | None = None,
-        rewrite_log_extra_data: dict | None = None,
-        openai_client: AsyncOpenAI | None = None,
-        model: Literal["gpt-3.5-turbo", "gpt-4-1106-preview"] | str = None,
         _track_raw_request_summaries: bool = False,
         **kwargs
-) -> CalmResponse:
+) -> CalmResponse[T]:
     """
     Get a completion with validated function call responses from the chat completions API.
 
@@ -225,8 +268,6 @@ async def get_completion(
         first completion during abbreviated tool calling. Usually this should tell the model not to supply tool
         arguments to not waste tokens.
     :param retries: number of attempts to give the model to fix broken function calls (first try not counted)
-    :param rewrite_log_destination: filename or io handle to log fine-tuning data to
-    :param rewrite_log_extra_data: extra data to merge into the jsonl line for this log entry
     :param openai_client: optional AsyncOpenAI client to use (use set_client() to set a default client)
     :param model: Which OpenAI model to use for the completion
     :param _track_raw_request_summaries: If true, adds a _raw_request_summary field to each of the objects in
@@ -270,7 +311,7 @@ async def get_completion(
     available_function_names: set[str] = set(calm_functions.openai_functions.keys())
 
     # tracks successful tool call outputs
-    result_instances: list[BaseModel] = []
+    result_instances: list[T] = []
 
     # for tracking what "really happened"
     total_completions_generated = 0
@@ -343,7 +384,7 @@ async def get_completion(
                 #   reset the message history to before the tool calls
                 #   but only allow the tool calls that were actually made
                 if not errors:
-                    # end loop early, cutting all of the abbreviated function calls from the message history
+                    # end loop early, cutting all abbreviated function calls from the message history
                     internal_messages = internal_messages[:rewrite_cutoff]
                     # TODO omitted_messages is misleading when this code branch is followed
                     abbreviation_mode = False
@@ -422,14 +463,6 @@ async def get_completion(
     final_error = None
     if errors:
         final_error = ExceptionGroup("Tool calling validation errors", errors)
-    elif rewrite_log_destination is not None:
-        functions_coalesced: list[OpenAIFunction] = list(calm_functions.openai_functions.values())
-        log_finetuning_data(
-            destination=rewrite_log_destination,
-            messages=internal_messages,
-            functions=functions_coalesced,
-            extra_data=rewrite_log_extra_data
-        )
 
     return CalmResponse(
         success=final_error is None,
@@ -484,7 +517,7 @@ async def _call_openai_with_structured_outputs_if_possible(
     if response_format and structured_outputs_available(model_name=model):
         # here we know that we definitely want the output to match one specific JSONSchema spec,
         # so we can use structured outputs.
-        logging.debug("Using Structured Outputs without tool calling for this request.")
+        logging.debug(USING_STRUCTURED_OUTPUTS)
         generated_completion: ParsedChatCompletion[response_format] = await openai_client.beta.chat.completions.parse(
             messages=messages,
             model=model,
@@ -516,7 +549,7 @@ async def _generate_one_completion(
         messages: Messages,
         openai_functions: dict[str, OpenAIFunction],
         available_function_names: set[str],
-        tool_choice: Literal[DEFAULT_BEHAVIOR] | ChatCompletionToolChoiceOptionParam,
+        tool_choice: DefaultBehavior | ChatCompletionToolChoiceOptionParam,
         model: str,  # todo
         openai_client: AsyncOpenAI,
         _track_raw_request_summaries: bool,
@@ -554,7 +587,7 @@ async def _generate_one_completion(
 class StructuredOutputOutcome:
     success: bool
     raw_content: str
-    result: BaseModelOrJsonCompatible | Exception
+    result: JsonCompatible | Exception
     tool_name: str | None
 
     def to_response(self) -> ChatCompletionSystemMessageParam:
@@ -570,7 +603,7 @@ class ToolCallOutcome:
     success: bool
     tool_call_id: str
     raw_tool_call: ChatCompletionMessageToolCall
-    result: BaseModelOrJsonCompatible | Exception
+    result: JsonCompatible | Exception
     tool_name: str | None
 
     def to_response(self) -> ChatCompletionToolMessageParam:
@@ -598,7 +631,8 @@ async def validate_structured_output(
     )
 
 async def execute_tool_calls(
-        tool_calls: list[ChatCompletionMessageToolCall], openai_functions: dict[str, OpenAIFunction]
+        tool_calls: list[ChatCompletionMessageToolCall],
+        openai_functions: dict[str, OpenAIFunction]
 ) -> list[ToolCallOutcome]:
     outcomes = []
     for tool_call in tool_calls:
