@@ -4,17 +4,20 @@ import pytest
 from openai import NOT_GIVEN
 
 from functioncalming import get_completion
+from functioncalming.client import openai_request_wrapper
 
 
-@asynccontextmanager
+@openai_request_wrapper
 async def wrap_openai_call(*, model, messages, tools, tool_choice, response_format, **kwargs):
     print('wrap_before')
     assert model is not None
     assert messages is not None
     assert tools is not None
+    assert isinstance(tool_choice, dict)
     assert response_format is NOT_GIVEN
-    yield
+    completion = yield
     print('wrap_after')
+    assert completion is not None
 
 @pytest.mark.asyncio
 async def test_no_function(caplog):

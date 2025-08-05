@@ -1,12 +1,13 @@
 import dataclasses
+import traceback
 import uuid
 
 import json
 import logging
 import os
-from contextlib import contextmanager, asynccontextmanager
+from contextlib import contextmanager, asynccontextmanager, _AsyncGeneratorContextManager
 from contextvars import ContextVar
-from typing import Literal, AsyncContextManager, Protocol
+from typing import Literal, AsyncContextManager, Protocol, AsyncGenerator, Callable
 from functools import cached_property
 
 from openai._types import NOT_GIVEN, NotGiven
@@ -248,10 +249,48 @@ class OpenAIRequestContextManager(Protocol):
     ) -> AsyncContextManager:
         ...
 
+@dataclasses.dataclass
+class _OpenAIResultCallbackExc(Exception):
+    """
+    Special Exception used to pass each Completion back to the context manager below
+    """
+    result: ChatCompletion | ParsedChatCompletion
 
-@asynccontextmanager
+def openai_request_wrapper(func: Callable[..., AsyncGenerator]) -> OpenAIRequestContextManager:
+    """
+    Decorator to wrap an async generator function @asynccontextmanager style to create a wrapper for calls to the OpenAI API.
+    `func` can access the OpenAI completion like so:
+    ```
+    @openai_request_wrapper
+    async def my_openai_wrapper(messages, tools, **kwargs):
+        ... # do something before the request
+        completion: ChatCompletion | ParsedChatCompletion = yield
+        ... # do something after the request / with the response
+    ```
+    The resulting wrapper should be passed to get_completion via the `openai_request_context_manager` param.
+    """
+    @asynccontextmanager
+    async def wrapper(*args, **kwargs):
+        gen = func(*args, **kwargs)
+        try:
+            yield await gen.asend(None)
+        except _OpenAIResultCallbackExc as e:
+            try:
+                await gen.asend(e.result)
+                raise ValueError(
+                    f'Async generator returned from {func.__name__} '
+                    f'did not raise StopAsyncIteration after second call to asend(...)!'
+                )
+            except StopAsyncIteration as e:
+                pass
+
+    wrapper.__is_openai_request_wrapper__ = True
+
+    return wrapper
+
+@openai_request_wrapper
 async def _noop_cm(**kwargs):
-    yield
+    req = yield
 
 
 async def get_completion[T: JsonCompatible](
@@ -301,6 +340,10 @@ async def get_completion[T: JsonCompatible](
             f"Cost tracking may be unavailable, and even if structured outputs are supported, they may be deactivated. "
             "To fix this, call register_model() with the appropriate settings for your model. "
         )
+
+    openai_request_context_manager = openai_request_context_manager or _noop_cm
+    if not hasattr(openai_request_context_manager, '__is_openai_request_wrapper__'):
+        openai_request_context_manager = openai_request_wrapper(openai_request_context_manager)
 
     # make a copy, we do not edit the passed-in message history
     internal_messages = messages[:] if messages is not None else []
@@ -366,7 +409,7 @@ async def get_completion[T: JsonCompatible](
             tool_choice=tool_choice,
             model=model,
             openai_client=openai_client,
-            openai_request_context_manager=openai_request_context_manager or _noop_cm,
+            openai_request_context_manager=openai_request_context_manager,
             _track_raw_request_summaries=_track_raw_request_summaries,
             **kwargs
         )
@@ -552,6 +595,7 @@ async def _call_openai_with_structured_outputs_if_possible(
                 model=model,
                 response_format=response_format
             )
+            raise _OpenAIResultCallbackExc(result=generated_completion)
         tools_for_api_call = [openai_functions[name_of_only_tool].tool_definition] or NOT_GIVEN
     else:
         tools_for_api_call = [
@@ -574,6 +618,7 @@ async def _call_openai_with_structured_outputs_if_possible(
                 tool_choice=tool_choice_for_api_call,
                 **kwargs
             )
+            raise _OpenAIResultCallbackExc(result=generated_completion)
     if _track_raw_request_summaries:
         generated_completion._raw_request_summary = RawRequestSummary(
             messages=messages[:], tools=tools_for_api_call, tool_choice=tool_choice_for_api_call
