@@ -4,9 +4,9 @@ import uuid
 import json
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
-from typing import Literal
+from typing import Literal, AsyncContextManager, Protocol
 from functools import cached_property
 
 from openai._types import NOT_GIVEN, NotGiven
@@ -237,6 +237,23 @@ class CalmResponse[T: JsonCompatible]:
         return model, total_cost, usage, some_cost_unknown
 
 
+class OpenAIRequestContextManager(Protocol):
+    def __call__(self,
+        model: str,
+        messages: Messages,
+        tools: list[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        tool_choice: Literal["none", "auto", "required"] | ChatCompletionNamedToolChoiceParam | NotGiven = NOT_GIVEN,
+        response_format: type[BaseModel] | NotGiven = NOT_GIVEN,
+        **kwargs
+    ) -> AsyncContextManager:
+        ...
+
+
+@asynccontextmanager
+async def _noop_cm(**kwargs):
+    yield
+
+
 async def get_completion[T: JsonCompatible](
         messages: Messages | None = None,
         system_prompt: str | None = None,
@@ -248,6 +265,7 @@ async def get_completion[T: JsonCompatible](
         openai_client: AsyncOpenAI | None = None,
         abbreviate_tools: bool = False,
         abbreviation_system_prompt: str | None = "Shortcut tool calling active! If calling tools, omit arguments.",
+        openai_request_context_manager: OpenAIRequestContextManager | None = None,
         _track_raw_request_summaries: bool = False,
         **kwargs
 ) -> CalmResponse[T]:
@@ -268,8 +286,9 @@ async def get_completion[T: JsonCompatible](
         first completion during abbreviated tool calling. Usually this should tell the model not to supply tool
         arguments to not waste tokens.
     :param retries: number of attempts to give the model to fix broken function calls (first try not counted)
-    :param openai_client: optional AsyncOpenAI client to use (use set_client() to set a default client)
+    :param openai_client: optional AsyncOpenAI client to use (use set_openai_client() to set a default client)
     :param model: Which OpenAI model to use for the completion
+    :param openai_request_context_manager: OpenAIRequestContextManager to wrap around every API request
     :param _track_raw_request_summaries: If true, adds a _raw_request_summary field to each of the objects in
         CalmResponse.raw_completions. This can be useful for understanding the full (virtual) message history and set of
         tools that was included with each request.
@@ -347,6 +366,7 @@ async def get_completion[T: JsonCompatible](
             tool_choice=tool_choice,
             model=model,
             openai_client=openai_client,
+            openai_request_context_manager=openai_request_context_manager or _noop_cm,
             _track_raw_request_summaries=_track_raw_request_summaries,
             **kwargs
         )
@@ -500,6 +520,7 @@ async def _call_openai_with_structured_outputs_if_possible(
         openai_functions: dict[str, OpenAIFunction],
         available_function_names: set[str],
         tool_choice_for_api_call: ChatCompletionToolChoiceOptionParam,
+        openai_request_context_manager: OpenAIRequestContextManager,
         _track_raw_request_summaries: bool,
         **kwargs
 ) -> ChatCompletion | ParsedChatCompletion:
@@ -510,7 +531,7 @@ async def _call_openai_with_structured_outputs_if_possible(
         available_function_names
     )
     if name_of_only_tool is not None and openai_functions[name_of_only_tool].was_defined_as_basemodel:
-        # if there is only one tool and it was defined as a BaseModel, we use response_format
+        # if there is only one tool, and it was defined as a BaseModel, we use response_format
         # if the tool was a function, we supply it via tools instead - OpenAI docs say that is best practice
         response_format = openai_functions[name_of_only_tool].non_validating_model
 
@@ -518,11 +539,19 @@ async def _call_openai_with_structured_outputs_if_possible(
         # here we know that we definitely want the output to match one specific JSONSchema spec,
         # so we can use structured outputs.
         logging.debug(USING_STRUCTURED_OUTPUTS)
-        generated_completion: ParsedChatCompletion[response_format] = await openai_client.beta.chat.completions.parse(
-            messages=messages,
-            model=model,
-            response_format=response_format
-        )
+        async with openai_request_context_manager(
+                messages=messages,
+                model=model,
+                tools=NOT_GIVEN,
+                tool_choice=NOT_GIVEN,
+                response_format=response_format,
+                **kwargs
+        ):
+            generated_completion: ParsedChatCompletion[response_format] = await openai_client.beta.chat.completions.parse(
+                messages=messages,
+                model=model,
+                response_format=response_format
+            )
         tools_for_api_call = [openai_functions[name_of_only_tool].tool_definition] or NOT_GIVEN
     else:
         tools_for_api_call = [
@@ -530,14 +559,21 @@ async def _call_openai_with_structured_outputs_if_possible(
             for name
             in available_function_names
         ] or NOT_GIVEN
-
-        generated_completion: ChatCompletion = await openai_client.chat.completions.create(
+        async with openai_request_context_manager(
             messages=messages,
             model=model,
             tools=tools_for_api_call,
             tool_choice=tool_choice_for_api_call,
+            response_format=NOT_GIVEN,
             **kwargs
-        )
+        ):
+            generated_completion: ChatCompletion = await openai_client.chat.completions.create(
+                messages=messages,
+                model=model,
+                tools=tools_for_api_call,
+                tool_choice=tool_choice_for_api_call,
+                **kwargs
+            )
     if _track_raw_request_summaries:
         generated_completion._raw_request_summary = RawRequestSummary(
             messages=messages[:], tools=tools_for_api_call, tool_choice=tool_choice_for_api_call
@@ -552,6 +588,7 @@ async def _generate_one_completion(
         tool_choice: DefaultBehavior | ChatCompletionToolChoiceOptionParam,
         model: str,  # todo
         openai_client: AsyncOpenAI,
+        openai_request_context_manager: OpenAIRequestContextManager,
         _track_raw_request_summaries: bool,
         **kwargs
 ) -> ChatCompletion | ParsedChatCompletion:
@@ -576,6 +613,7 @@ async def _generate_one_completion(
             openai_functions=openai_functions,
             available_function_names=available_function_names,
             tool_choice_for_api_call=tool_choice_for_api_call,
+            openai_request_context_manager=openai_request_context_manager,
             _track_raw_request_summaries=_track_raw_request_summaries,
             **kwargs
         )
