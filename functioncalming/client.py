@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import traceback
 import uuid
@@ -272,17 +273,19 @@ def openai_request_wrapper(func: Callable[..., AsyncGenerator]) -> OpenAIRequest
     @asynccontextmanager
     async def wrapper(*args, **kwargs):
         gen = func(*args, **kwargs)
-        try:
-            yield await gen.asend(None)
-        except _OpenAIResultCallbackExc as e:
+        async with contextlib.aclosing(gen) as agen:
             try:
-                await gen.asend(e.result)
-                raise ValueError(
-                    f'Async generator returned from {func.__name__} '
-                    f'did not raise StopAsyncIteration after second call to asend(...)!'
-                )
-            except StopAsyncIteration as e:
-                pass
+                res = await agen.asend(None)
+                yield res
+            except _OpenAIResultCallbackExc as e:
+                try:
+                    await agen.asend(e.result)
+                    raise ValueError(
+                        f'Async generator returned from {func.__name__} '
+                        f'did not raise StopAsyncIteration after second call to asend(...)!'
+                    )
+                except StopAsyncIteration:
+                    pass
 
     wrapper.__is_openai_request_wrapper__ = True
 
