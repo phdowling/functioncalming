@@ -788,12 +788,14 @@ async def execute_tool_calls(
             # To force a retry due to a semantic error the model should correct, raise a ToolCallError instead
             raise e
         except ValidationError as e:
+            as_json = e.json()
+            # TODO for each error, clear out 'ctx' and 'input' to avoid crowding the context
             outcomes.append(
                 ToolCallOutcome(
                     success=False,
                     tool_call_id=tool_call.id,
                     raw_tool_call=tool_call,
-                    result=e.json(),
+                    result=as_json,
                     error=e,
                     tool_name=function_name
                 )

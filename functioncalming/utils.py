@@ -56,9 +56,8 @@ class OpenAIFunction:
 
     @functools.cached_property
     def schema(self):
-        # TODO use non-validating model for functions? Do the same best practices apply?
         schema = self.non_validating_model.model_json_schema()
-        schema["strict"] = True  # turns on structured outputs
+        schema["strict"] = True
         schema.pop("title", None)
         schema.pop("description", None)
         return schema
@@ -68,7 +67,8 @@ class OpenAIFunction:
         return FunctionDefinition(
             name=self.name,
             description=self.description,
-            parameters=self.schema
+            parameters=self.schema,
+            strict=True  # turns on structured outputs
         )
 
     @property
