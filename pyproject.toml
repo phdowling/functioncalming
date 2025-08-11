@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "functioncalming"
-version = "0.0.18"
+version = "0.0.19"
 description = "Robust and reliable OpenAI tool calling"
 authors = ["Philipp Dowling <phdowling@users.noreply.github.com>"]
 license = "MIT"
@@ -20,7 +20,7 @@ keywords = [
 
 [tool.poetry.dependencies]
 python = "^3.12"
-openai = "^1.95.1"
+openai = ">=1.99.6"
 pydantic = "^2.5.2"
 docstring-parser = "^0.16"
 

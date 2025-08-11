@@ -1,12 +1,11 @@
 import contextlib
 import dataclasses
-import traceback
 import uuid
 
 import json
 import logging
 import os
-from contextlib import contextmanager, asynccontextmanager, _AsyncGeneratorContextManager
+from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
 from typing import Literal, AsyncContextManager, Protocol, AsyncGenerator, Callable
 from functools import cached_property
@@ -483,7 +482,7 @@ async def get_completion[T: JsonCompatible](
             break
 
         # 'errors' is overwritten intentionally, we only ever care about the errors of the last tool call(s)
-        errors = [outcome.result for outcome in outcomes if not outcome.success]
+        errors = [outcome.error for outcome in outcomes if not outcome.success]
 
         if not abbreviation_mode:
             # if we are not in abbreviation mode, we just track the outputs and go on to handle errors
@@ -673,7 +672,8 @@ async def _generate_one_completion(
 class StructuredOutputOutcome:
     success: bool
     raw_content: str
-    result: JsonCompatible | Exception
+    result: JsonCompatible
+    error: BaseException | None
     tool_name: str | None
 
     def to_response(self) -> ChatCompletionSystemMessageParam:
@@ -681,7 +681,7 @@ class StructuredOutputOutcome:
             raise ValueError("Shouldn't need to call to_response on a successful structured response.")
         return ChatCompletionSystemMessageParam(
             role="system",
-            content=f"Error: {self.result}"
+            content=f"Error: {serialize_openai_function_result(self.result)}"
         )
 
 @dataclasses.dataclass
@@ -689,14 +689,15 @@ class ToolCallOutcome:
     success: bool
     tool_call_id: str
     raw_tool_call: ChatCompletionMessageToolCall
-    result: JsonCompatible | Exception
+    result: JsonCompatible
+    error: BaseException | None
     tool_name: str | None
 
     def to_response(self) -> ChatCompletionToolMessageParam:
         return ChatCompletionToolMessageParam(
             role="tool",
             tool_call_id=self.tool_call_id,
-            content=serialize_openai_function_result(self.result) if self.success else f"Error: {self.result}"
+            content=serialize_openai_function_result(self.result)
         )
 
 
@@ -704,15 +705,23 @@ async def validate_structured_output(
         message: ParsedChatCompletionMessage, openai_function: OpenAIFunction
 ) -> StructuredOutputOutcome:
     success = True
+    error = None
     try:
         result = await openai_function.callback(**message.parsed.model_dump())
-    except Exception as e:
-        result = e
+    except ValidationError as e:
+        error = e
+        result = e.json()
         success = False
+    except Exception as e:
+        error = e
+        result = f"Error: {e}"
+        success = False
+
     return StructuredOutputOutcome(
         success=success,
         raw_content=message.content,
         result=result,
+        error=error,
         tool_name=openai_function.name
     )
 
@@ -725,14 +734,16 @@ async def execute_tool_calls(
         function_name = tool_call.function.name
 
         if function_name not in openai_functions:
-            e = ToolCallError(f"Error: function `{function_name}` does not exist.")
+            msg = f"Error: function `{function_name}` does not exist."
+            e = ToolCallError(msg)
 
             outcomes.append(
                 ToolCallOutcome(
                     success=False,
                     tool_call_id=tool_call.id,
                     raw_tool_call=tool_call,
-                    result=e,
+                    result=msg,
+                    error=e,
                     tool_name=None
                 )
             )
@@ -747,7 +758,8 @@ async def execute_tool_calls(
                     success=False,
                     tool_call_id=tool_call.id,
                     raw_tool_call=tool_call,
-                    result=e,
+                    result=f'Error: invalid JSON ({e})',
+                    error=e,
                     tool_name=function_name
                 )
             )
@@ -765,6 +777,7 @@ async def execute_tool_calls(
                     tool_call_id=tool_call.id,
                     raw_tool_call=tool_call,
                     result=result_instance,
+                    error=None,
                     tool_name=function_name
                 )
             )
@@ -774,13 +787,25 @@ async def execute_tool_calls(
             # since the model did fine calling the tool here.
             # To force a retry due to a semantic error the model should correct, raise a ToolCallError instead
             raise e
-        except (ValidationError, ToolCallError) as e:
+        except ValidationError as e:
             outcomes.append(
                 ToolCallOutcome(
                     success=False,
                     tool_call_id=tool_call.id,
                     raw_tool_call=tool_call,
-                    result=e,
+                    result=e.json(),
+                    error=e,
+                    tool_name=function_name
+                )
+            )
+        except ToolCallError as e:
+            outcomes.append(
+                ToolCallOutcome(
+                    success=False,
+                    tool_call_id=tool_call.id,
+                    raw_tool_call=tool_call,
+                    result=f'Tool call error: {e}',
+                    error=e,
                     tool_name=function_name
                 )
             )
