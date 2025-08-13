@@ -16,10 +16,10 @@ from openai.types.chat.chat_completion_message_tool_call import Function
 from pydantic import BaseModel, ValidationError
 from openai import AsyncOpenAI
 
-from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall, \
-    ChatCompletionToolMessageParam, ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam, \
-    ChatCompletionToolChoiceOptionParam, ChatCompletionAssistantMessageParam, \
-    ChatCompletionToolParam, ChatCompletionNamedToolChoiceParam, ParsedChatCompletion, ParsedChatCompletionMessage
+from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionToolMessageParam, \
+    ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam, ChatCompletionToolChoiceOptionParam, \
+    ChatCompletionAssistantMessageParam, ChatCompletionToolParam, ChatCompletionNamedToolChoiceParam, \
+    ParsedChatCompletion, ParsedChatCompletionMessage, ChatCompletionMessageFunctionToolCall
 from openai.types.completion_usage import CompletionUsage
 
 from functioncalming.context import set_calm_context
@@ -238,7 +238,7 @@ class CalmResponse[T: JsonCompatible]:
         return model, total_cost, usage, some_cost_unknown
 
 
-class OpenAIRequestContextManager(Protocol):
+class CalmMiddleware(Protocol):
     def __call__(self,
         model: str,
         messages: Messages,
@@ -256,18 +256,20 @@ class _OpenAIResultCallbackExc(Exception):
     """
     result: ChatCompletion | ParsedChatCompletion
 
-def openai_request_wrapper(func: Callable[..., AsyncGenerator]) -> OpenAIRequestContextManager:
+def calm_middleware(func: Callable[..., AsyncGenerator]) -> CalmMiddleware:
     """
-    Decorator to wrap an async generator function @asynccontextmanager style to create a wrapper for calls to the OpenAI API.
+    Decorator to wrap an async generator function @asynccontextmanager style to create a middleware / wrapper for
+    the actual OpenAI/LLM API calls.
+
     `func` can access the OpenAI completion like so:
     ```
-    @openai_request_wrapper
+    @calm_middleware
     async def my_openai_wrapper(messages, tools, **kwargs):
         ... # do something before the request
         completion: ChatCompletion | ParsedChatCompletion = yield
         ... # do something after the request / with the response
     ```
-    The resulting wrapper should be passed to get_completion via the `openai_request_context_manager` param.
+    The resulting wrapper should be passed to get_completion via the `middleware` param.
     """
     @asynccontextmanager
     async def wrapper(*args, **kwargs):
@@ -285,13 +287,16 @@ def openai_request_wrapper(func: Callable[..., AsyncGenerator]) -> OpenAIRequest
                     )
                 except StopAsyncIteration:
                     pass
+            except BaseException as e:
+                # this is needed so the wrapper is able to handle any exceptions thrown during the API call
+                await agen.athrow(e)
 
-    wrapper.__is_openai_request_wrapper__ = True
+    wrapper.__is_calm_middleware__ = True
 
     return wrapper
 
-@openai_request_wrapper
-async def _noop_cm(**kwargs):
+@calm_middleware
+async def _noop_mw(**kwargs):
     req = yield
 
 
@@ -306,7 +311,7 @@ async def get_completion[T: JsonCompatible](
         openai_client: AsyncOpenAI | None = None,
         abbreviate_tools: bool = False,
         abbreviation_system_prompt: str | None = "Shortcut tool calling active! If calling tools, omit arguments.",
-        openai_request_context_manager: OpenAIRequestContextManager | None = None,
+        middleware: CalmMiddleware | None = None,
         _track_raw_request_summaries: bool = False,
         **kwargs
 ) -> CalmResponse[T]:
@@ -329,7 +334,7 @@ async def get_completion[T: JsonCompatible](
     :param retries: number of attempts to give the model to fix broken function calls (first try not counted)
     :param openai_client: optional AsyncOpenAI client to use (use set_openai_client() to set a default client)
     :param model: Which OpenAI model to use for the completion
-    :param openai_request_context_manager: OpenAIRequestContextManager to wrap around every API request
+    :param middleware: optional CalmMiddleware that will be used to wrap every API request
     :param _track_raw_request_summaries: If true, adds a _raw_request_summary field to each of the objects in
         CalmResponse.raw_completions. This can be useful for understanding the full (virtual) message history and set of
         tools that was included with each request.
@@ -343,9 +348,11 @@ async def get_completion[T: JsonCompatible](
             "To fix this, call register_model() with the appropriate settings for your model. "
         )
 
-    openai_request_context_manager = openai_request_context_manager or _noop_cm
-    if not hasattr(openai_request_context_manager, '__is_openai_request_wrapper__'):
-        openai_request_context_manager = openai_request_wrapper(openai_request_context_manager)
+    if middleware is None:
+        middleware = _noop_mw
+
+    if not hasattr(middleware, '__is_calm_middleware__'):
+        middleware = calm_middleware(middleware)
 
     # make a copy, we do not edit the passed-in message history
     internal_messages = messages[:] if messages is not None else []
@@ -384,7 +391,7 @@ async def get_completion[T: JsonCompatible](
 
     # for message history rewriting
     rewrite_cutoff = len(internal_messages)
-    successful_tool_calls: list[ChatCompletionMessageToolCall] = []
+    successful_tool_calls: list[ChatCompletionMessageFunctionToolCall] = []
     successful_tool_responses: list[ChatCompletionToolMessageParam] = []
 
     if abbreviation_mode and abbreviation_system_prompt is not None:
@@ -411,7 +418,7 @@ async def get_completion[T: JsonCompatible](
             tool_choice=tool_choice,
             model=model,
             openai_client=openai_client,
-            openai_request_context_manager=openai_request_context_manager,
+            middleware=middleware,
             _track_raw_request_summaries=_track_raw_request_summaries,
             **kwargs
         )
@@ -565,7 +572,7 @@ async def _call_openai_with_structured_outputs_if_possible(
         openai_functions: dict[str, OpenAIFunction],
         available_function_names: set[str],
         tool_choice_for_api_call: ChatCompletionToolChoiceOptionParam,
-        openai_request_context_manager: OpenAIRequestContextManager,
+        middleware: CalmMiddleware,
         _track_raw_request_summaries: bool,
         **kwargs
 ) -> ChatCompletion | ParsedChatCompletion:
@@ -580,11 +587,12 @@ async def _call_openai_with_structured_outputs_if_possible(
         # if the tool was a function, we supply it via tools instead - OpenAI docs say that is best practice
         response_format = openai_functions[name_of_only_tool].non_validating_model
 
+
     if response_format and structured_outputs_available(model_name=model):
         # here we know that we definitely want the output to match one specific JSONSchema spec,
         # so we can use structured outputs.
         logging.debug(USING_STRUCTURED_OUTPUTS)
-        async with openai_request_context_manager(
+        async with middleware(
                 messages=messages,
                 model=model,
                 tools=NOT_GIVEN,
@@ -595,7 +603,8 @@ async def _call_openai_with_structured_outputs_if_possible(
             generated_completion: ParsedChatCompletion[response_format] = await openai_client.beta.chat.completions.parse(
                 messages=messages,
                 model=model,
-                response_format=response_format
+                response_format=response_format,
+                **kwargs
             )
             raise _OpenAIResultCallbackExc(result=generated_completion)
         tools_for_api_call = [openai_functions[name_of_only_tool].tool_definition] or NOT_GIVEN
@@ -605,7 +614,7 @@ async def _call_openai_with_structured_outputs_if_possible(
             for name
             in available_function_names
         ] or NOT_GIVEN
-        async with openai_request_context_manager(
+        async with middleware(
             messages=messages,
             model=model,
             tools=tools_for_api_call,
@@ -635,7 +644,7 @@ async def _generate_one_completion(
         tool_choice: DefaultBehavior | ChatCompletionToolChoiceOptionParam,
         model: str,  # todo
         openai_client: AsyncOpenAI,
-        openai_request_context_manager: OpenAIRequestContextManager,
+        middleware: CalmMiddleware,
         _track_raw_request_summaries: bool,
         **kwargs
 ) -> ChatCompletion | ParsedChatCompletion:
@@ -660,7 +669,7 @@ async def _generate_one_completion(
             openai_functions=openai_functions,
             available_function_names=available_function_names,
             tool_choice_for_api_call=tool_choice_for_api_call,
-            openai_request_context_manager=openai_request_context_manager,
+            middleware=middleware,
             _track_raw_request_summaries=_track_raw_request_summaries,
             **kwargs
         )
@@ -688,7 +697,7 @@ class StructuredOutputOutcome:
 class ToolCallOutcome:
     success: bool
     tool_call_id: str
-    raw_tool_call: ChatCompletionMessageToolCall
+    raw_tool_call: ChatCompletionMessageFunctionToolCall
     result: JsonCompatible
     error: BaseException | None
     tool_name: str | None
@@ -726,7 +735,7 @@ async def validate_structured_output(
     )
 
 async def execute_tool_calls(
-        tool_calls: list[ChatCompletionMessageToolCall],
+        tool_calls: list[ChatCompletionMessageFunctionToolCall],
         openai_functions: dict[str, OpenAIFunction]
 ) -> list[ToolCallOutcome]:
     outcomes = []
@@ -825,7 +834,7 @@ async def maybe_shortcut_trivial_function_call(
                 role="assistant",
                 content=None,
                 tool_calls=[
-                    ChatCompletionMessageToolCall(
+                    ChatCompletionMessageFunctionToolCall(
                         id=uuid.uuid4().hex,
                         type="function",
                         function=Function(
@@ -913,7 +922,7 @@ def rewrite_message_history(
         *,
         messages: Messages,
         rewrite_cutoff: int,
-        successful_tool_calls: list[ChatCompletionMessageToolCall],
+        successful_tool_calls: list[ChatCompletionMessageFunctionToolCall],
         successful_tool_responses: list[ChatCompletionToolMessageParam],
         had_successful_structured_output: bool
 ):

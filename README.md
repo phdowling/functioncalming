@@ -207,18 +207,26 @@ with set_openai_client(custom_client):
 Wrap OpenAI API calls with custom logic:
 
 ```python
-from functioncalming.client import openai_request_wrapper
+from functioncalming.client import calm_middleware
 
-@openai_request_wrapper
+
+@calm_middleware
 async def log_requests(*, model, messages, tools, **kwargs):
     print(f"Making request to {model}")
-    completion = yield  # OpenAI API call happens here
-    print(f"Got response with {completion.usage.total_tokens} tokens")
+    try:
+        completion = yield  # OpenAI API call happens here
+        print(f"Got response with {completion.usage.total_tokens} tokens")
+    except Exception as e:
+        print(f"Call to OpenAI failed: {e}")
+        # Note: you should always re-raise here - of course, you can still wrap the call to get_completion in a try/except
+        raise e
+    
+
 
 response = await get_completion(
     user_message="Hello",
     tools=[SomeTool],
-    openai_request_context_manager=log_requests
+    middleware=log_requests
 )
 ```
 

@@ -175,10 +175,10 @@ async def test_abbreviate(caplog):
         This is the main param of the other function.
         If we add many tokens here, the request becomes more expensive. For that reason, it's advisable to either keep
         descriptions short, or to use abbreviated tool calling!
-        This happens to have a pretty long description, most of it is irrelevant but it sure does add to the total
+        This happens to have a pretty long description, most of it is irrelevant, but it sure does add to the total
         token count!
         """
-        another_param: dict = Field(..., description="Especially if there are more parameters!")
+        another_param: list[str] = Field(..., description="Especially if there are more parameters!")
 
     class good_function(BaseModel):  # make this a basemodel so it will be called with structured outputs eventually
         """
